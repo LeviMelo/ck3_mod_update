@@ -102,7 +102,7 @@ class PdsLexer:
         self.tokens.append(PdsToken('EOF', '', self.line, self.column)) 
         return self.tokens
 
-# --- PdsNode Classes (Major changes to copy() and to_string() methods) ---
+# --- PdsNode Classes (No changes needed) ---
 
 class PdsNode:
     def __init__(self, line_number=-1): 
@@ -160,7 +160,7 @@ class PdsBlankLine(PdsNode):
         super().__init__(line_number=line_number)
 
     def to_string(self, current_indent=0, is_inline_context=False): # is_inline_context not used here
-        return "\n" 
+        return "\n" # A blank line is represented by a single newline
 
     def copy(self):
         new_node = PdsBlankLine(line_number=self.line_number)
@@ -409,7 +409,7 @@ class PdsBlock(PdsNode):
         else: self.children.append(new_child_node)
         return True
 
-# --- PdsParser (Minor changes to newline handling and PdsBlock indent setting) ---
+# --- PdsParser (Significant changes for newline handling) ---
 class PdsParser:
     def __init__(self):
         self.tokens = []
@@ -459,10 +459,17 @@ class PdsParser:
         return PdsComment(token.value, token.line)
 
     def _parse_blank_line_node(self):
-        first_newline_token = self._peek() 
+        """
+        Parses and consumes all consecutive NEWLINE tokens that constitute a single logical blank line.
+        Assumes the current token is a NEWLINE and it's confirmed to be part of a blank line sequence.
+        """
+        first_newline_token = self._consume('NEWLINE') 
         line_number = first_newline_token.line
+        
+        # Consume any additional consecutive NEWLINEs that form this single blank line logical unit
         while self._peek().type == 'NEWLINE':
             self._advance()
+        
         return PdsBlankLine(line_number)
 
     def _parse_value(self): 
@@ -470,13 +477,14 @@ class PdsParser:
         parsed_value = None
         
         if value_token_peeked.type == 'LBRACE':
+            # Note: LBRACE token for anonymous block is handled in _parse_block directly
+            # This branch for LBRACE is specifically when LBRACE is the *value* of a KVP/Operator
             lbrace_token = self._consume('LBRACE') 
             comment_on_lbrace_line = None
             if self._peek().type == 'COMMENT' and self._peek().line == lbrace_token.line:
                 comment_on_lbrace_line = self._consume('COMMENT').value
             
             # Anonymous block: key is "", line number is lbrace_token.line
-            # Indent level of this block will be set in _parse_block.
             parsed_value = self._parse_block("", lbrace_token.line) 
             if isinstance(parsed_value, PdsBlock) and comment_on_lbrace_line:
                 parsed_value.comment_text_on_line = comment_on_lbrace_line
@@ -493,18 +501,17 @@ class PdsParser:
             val_tok = self._consume('STRING')
             parsed_value = val_tok.value[1:-1] 
         else:
-            self._error(f"Expected a value (IDENTIFIER, NUMBER, STRING, or LBRACE for a block)")
+            self._error(f"Expected a value (IDENTIFIER, NUMBER, STRING, or LBRACE for a block) but got {value_token_peeked.type}")
             
         return parsed_value 
 
 
     def _parse_key_value_pair(self, key_string, key_line_number):
-        # '=' is already consumed.
+        # '=' is already consumed by the caller.
         value = self._parse_value() 
         
         comment_on_kvp_line = None
-        # Get line of the token that ended the value (or was the LBRACE for a block value)
-        # Note: If value is a PdsBlock, its line comment is handled by _parse_value/_parse_block directly.
+        # Only attach comment if value is not a block (blocks handle their own comments on LBRACE line)
         if not isinstance(value, PdsBlock) and self.current_token_index > 0:
             value_end_line = self.tokens[self.current_token_index-1].line
             if self._peek().type == 'COMMENT' and self._peek().line == value_end_line:
@@ -513,6 +520,7 @@ class PdsParser:
         return PdsKeyValuePair(key_string, value, key_line_number, comment_on_kvp_line)
 
     def _parse_operator_condition(self, key_string, operator_str, key_line_number):
+        # Operator is already consumed by the caller.
         value = self._parse_value() 
         
         comment_on_op_line = None
@@ -532,6 +540,7 @@ class PdsParser:
             if token.type in ['IDENTIFIER', 'NUMBER', 'STRING']:
                 values.append(self._parse_value()) 
             elif token.type == 'NEWLINE' or token.type == 'COMMENT': 
+                # Newlines and comments within a list's value section are just skipped as separators
                 self._advance() 
             else:
                 self._error(f"Unexpected token {token.type} inside PdsList values.")
@@ -565,12 +574,27 @@ class PdsParser:
              block_node.indent_level = parent_block.indent_level + 4
 
 
+        # Main loop for parsing children within a block
         while self._peek().type != 'RBRACE' and not self.is_eof():
-            child_node = self._parse_statement() 
-            if child_node:
-                block_node.add_child(child_node) # add_child sets child's indent_level
-            elif self.is_eof() or self._peek().type == 'RBRACE': break
-            else: self._error(f"No progress in block '{key_part_string}' before RBRACE/EOF.")
+            token = self._peek()
+            
+            if token.type == 'NEWLINE':
+                # A PdsBlankLine node is created only for sequences of two or more newlines.
+                # A single newline is simply consumed as a separator.
+                if self._peek(1).type == 'NEWLINE': # Check for double newline
+                    block_node.add_child(self._parse_blank_line_node())
+                else: # Single newline, just consume as separator
+                    self._advance()
+            elif token.type == 'COMMENT':
+                block_node.add_child(self._parse_comment())
+            elif token.type == 'EOF':
+                self._error("Unexpected EOF inside block.")
+            else: # Must be a statement (KVP, Operator, List, Block)
+                child_node = self._parse_statement()
+                if child_node:
+                    block_node.add_child(child_node)
+                else: # Should not happen if _parse_statement is well-defined
+                    self._error(f"No progress in block '{key_part_string}' before RBRACE/EOF after consuming a statement token.")
         
         self._consume('RBRACE') 
         
@@ -579,45 +603,12 @@ class PdsParser:
         return block_node
 
     def _parse_statement(self):
-        # This loop will skip any single newlines that are purely for formatting
-        # and don't constitute an actual PdsBlankLine node.
-        # It ensures that 'true' blank lines (multiple newlines or newlines before RBRACE/EOF)
-        # are parsed into PdsBlankLine nodes.
-        while self._peek().type == 'NEWLINE':
-            is_true_blank_line = False
-            
-            # Check for multiple consecutive newlines, skipping over comments in between
-            temp_idx = self.current_token_index + 1
-            while temp_idx < len(self.tokens) :
-                peeked_ahead_token = self.tokens[temp_idx]
-                if peeked_ahead_token.type == 'NEWLINE':
-                    is_true_blank_line = True; break 
-                # If it's a comment and then not a newline, then this is just \n#comment then content.
-                # So we break from this inner loop and treat the first newline as a separator.
-                if peeked_ahead_token.type not in ['COMMENT']: 
-                    break
-                temp_idx += 1
-            
-            # Additional check for newline immediately before RBRACE or EOF, or at top-level.
-            # This handles cases like `block { ... child\n}` or `root_node\n<EOF>`
-            if self._peek(1).type in ['RBRACE', 'EOF']: # Newline then RBRACE or EOF
-                 is_true_blank_line = True
-            elif not self.stack and self._peek(1).type in ['IDENTIFIER', 'NUMBER', 'COMMENT']: # Top-level newline
-                # If a newline appears at the top level and is followed by content, it might be a blank line
-                # if there are *multiple* newlines. Single newlines are often just separators.
-                # The `is_true_blank_line` from `temp_idx` loop handles actual blank lines.
-                # If not a "true blank line" by multiple newlines, just consume it as separator.
-                pass # Already handled, or continue to consume as separator.
-
-            if is_true_blank_line:
-                return self._parse_blank_line_node()
-            else: # This is a single separator newline, consume it and re-evaluate
-                self._advance() 
-                if self.is_eof(): return None # Consumed last newlines before EOF
+        # This method now only parses actual statements (KVP, Operator, List, Block).
+        # Newlines and comments are handled by the calling loops (parse_file, _parse_block).
         
         token = self._peek()
-        if token.type == 'COMMENT': return self._parse_comment()
-        if token.type == 'EOF': return None
+        if token.type in ['NEWLINE', 'COMMENT', 'EOF']:
+            self._error(f"Internal Parser Error: _parse_statement called with {token.type}. Expected a statement token.")
 
         key_token_peeked = self._peek()
         key_value_str = key_token_peeked.value 
@@ -639,6 +630,7 @@ class PdsParser:
                 self._consume('EQUALS') 
                 if self._peek().type == 'LBRACE': 
                     self._consume('LBRACE') 
+                    # Heuristic for block vs list
                     is_block_heuristic = False; scan_idx = self.current_token_index; h_brace_balance = 1 
                     while scan_idx < len(self.tokens):
                         h_token = self.tokens[scan_idx]
@@ -664,7 +656,7 @@ class PdsParser:
                 self._consume('LBRACE')
                 node_to_return = self._parse_block(key_value_str, key_line_num)
             else: self._error(f"Unexpected token '{next_structural_token_peeked.type}' after key '{key_value_str}'.")
-        else: self._error(f"Statement must start with IDENTIFIER, NUMBER, COMMENT. Got {token.type}")
+        else: self._error(f"Statement must start with IDENTIFIER or NUMBER. Got {token.type}")
         
         # Set indent level for top-level statements (root nodes)
         if node_to_return and not self.stack: 
@@ -692,11 +684,24 @@ class PdsParser:
         if not self.tokens or self.tokens[0].type == 'EOF': return []
             
         while not self.is_eof():
-            try:
-                node = self._parse_statement()
-                if node: self.root_nodes.append(node)
-                elif not self.is_eof(): self._error("Parser yielded no node and is not at EOF.") 
-            except ValueError as parse_err: print(f"Parser error in {filepath}: {parse_err}"); return [] 
+            token = self._peek()
+            if token.type == 'NEWLINE':
+                # A PdsBlankLine node is created only for sequences of two or more newlines.
+                # A single newline is simply consumed as a separator.
+                if self._peek(1).type == 'NEWLINE': 
+                    self.root_nodes.append(self._parse_blank_line_node())
+                else: # Single newline, just consume as separator
+                    self._advance()
+            elif token.type == 'COMMENT':
+                self.root_nodes.append(self._parse_comment())
+            elif token.type == 'EOF':
+                break # Reached end
+            else:
+                try:
+                    node = self._parse_statement()
+                    if node: self.root_nodes.append(node)
+                    elif not self.is_eof(): self._error("Parser yielded no node and is not at EOF.") 
+                except ValueError as parse_err: print(f"Parser error in {filepath}: {parse_err}"); return [] 
         return self.root_nodes
 
     @staticmethod
