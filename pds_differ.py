@@ -1,4 +1,4 @@
-# pds_differ.py (Final Diff Logic Refinement)
+# pds_differ.py
 from pds_parser import PdsNode, PdsBlock, PdsKeyValuePair, PdsList, PdsComment, PdsBlankLine
 
 class PdsChange:
@@ -27,12 +27,13 @@ class PdsChange:
                 return f"{node.key}={{...}}"
             if isinstance(node, PdsComment):
                 text = node.comment_text if hasattr(node, 'comment_text') else node.raw_line.strip()
+                # Display the comment text itself, or a short snippet
                 return f"Comment:'{text[:20]}...'" if len(text) > 20 else f"Comment:'{text}'"
             if isinstance(node, PdsBlankLine):
-                return "Blank"
+                return "BlankLine" # More specific
             raw_strip = node.raw_line.strip()
             if raw_strip == "}": return "ClosingBrace"
-            return f"Node('{raw_strip[:20]}...')"
+            return f"Node('{raw_strip[:20]}...')" # Generic node type for unhandled
 
         old_repr = f"O:{_get_node_short_repr(self.old_node)}"
         mod_repr = f"M:{_get_node_short_repr(self.mod_node)}"
@@ -58,9 +59,15 @@ class PdsDiffer:
         mod_map = {self._get_node_identifier(node): node for node in mod_nodes if node is not None}
         new_map = {self._get_node_identifier(node): node for node in new_nodes if node is not None}
 
-        all_identifiers = sorted(list(set(old_map.keys()) | set(mod_map.keys()) | set(new_map.keys())))
+        # Collect all relevant identifiers, filtering out identical blanks/comments
+        all_identifiers = set()
+        for nodes_map in [old_map, mod_map, new_map]:
+            for identifier, node in nodes_map.items():
+                if identifier is None: # This means it's a filtered blank/comment
+                    continue
+                all_identifiers.add(identifier)
         
-        for identifier_idx, identifier in enumerate(all_identifiers):
+        for identifier_idx, identifier in enumerate(sorted(list(all_identifiers))):
             old_node = old_map.get(identifier)
             mod_node = mod_map.get(identifier)
             new_node = new_map.get(identifier)
@@ -70,19 +77,19 @@ class PdsDiffer:
 
             status_O_M = self._compare_presence_and_content(old_node, mod_node)
             status_O_N = self._compare_presence_and_content(old_node, new_node)
-            status_M_N = self._compare_presence_and_content(mod_node, new_node) # For direct M vs N comparison
+            status_M_N = self._compare_presence_and_content(mod_node, new_node) 
 
             change_type = None
 
             # --- Prioritized Change Detection Logic ---
-
+            
             # 1. ADDED by Mod (not in O, in M)
             if status_O_M == 'ADDED':
                 if status_O_N == 'ADDED': # Also added by New Vanilla (converged or conflicting)
                     if status_M_N == 'IDENTICAL':
                         change_type = 'MOD_ADDED_CONVERGED'
                     else:
-                        change_type = 'CONFLICT_ADDITION' # Mod and NV added different versions
+                        change_type = 'CONFLICT_ADDITION' 
                 else: # Only Mod added it (not in New Vanilla relative to Old)
                     change_type = 'MOD_ADDED'
             
@@ -97,14 +104,12 @@ class PdsDiffer:
                 if status_O_N == 'DELETED': # Also deleted by New Vanilla
                     change_type = 'MOD_DELETED_VANILLA_ALSO_DELETED'
                 elif status_O_N == 'MODIFIED': # NV modified it
-                    change_type = 'CONFLICT_DELETION' # Mod deleted, NV modified
+                    change_type = 'CONFLICT_DELETION' # Mod deleted, NV modified (e.g. trait_block case)
                 elif status_O_N == 'IDENTICAL': # NV did not change it
                     change_type = 'MOD_DELETED'
 
             # 4. DELETED by Vanilla (in O, not in N, and not already handled by MOD_DELETED)
-            elif status_O_N == 'DELETED':
-                # This branch implies MOD_DELETED (status_O_M == 'DELETED') was FALSE
-                # So if Mod is still present in M, it's a conflict or only NV deleted.
+            elif status_O_N == 'DELETED': # If not caught by MOD_DELETED above, then pure NV deletion
                 if status_O_M == 'MODIFIED': # Mod modified it
                     change_type = 'CONFLICT_DELETION' # NV deleted, Mod modified
                 elif status_O_M == 'IDENTICAL': # Mod did not change it
@@ -126,7 +131,7 @@ class PdsDiffer:
             
             # 7. IDENTICAL (All three are the same or not a change)
             else: # status_O_M == 'IDENTICAL' and status_O_N == 'IDENTICAL'
-                pass # No change to report
+                pass # No change to report if all are identical and not handled by other cases
 
             if change_type:
                 changes.append(PdsChange(change_type, node_key_path, old_node, mod_node, new_node, current_path))
@@ -140,57 +145,91 @@ class PdsDiffer:
 
         return changes
 
-    # Helper methods remain the same (no changes to: _get_node_identifier, _get_display_key, _are_nodes_structurally_different, _compare_presence_and_content)
     def _get_node_identifier(self, node):
-        if node is None: return None
+        """
+        Helper to get a unique identifier for a node within its parent's context.
+        Returns None for BlankLines and Comments that are 'pure' (identical across all versions)
+        to filter them out from the main diff list.
+        """
+        if node is None: return None # Should not happen if called from maps
+        
+        # Identify by key for key-value, list, and block nodes
         if hasattr(node, 'key'):
-            return node.key
+            return node.key 
+        
+        # For non-keyed nodes (comments, blank lines)
+        # We need a stable identifier that doesn't change if the line number shifts due to insertions/deletions.
+        # So we use a content hash.
         if isinstance(node, PdsComment):
-            return f"__COMMENT_L{node.line_number}_{hash(node.comment_text if hasattr(node, 'comment_text') else node.raw_line)}"
-        if isinstance(node, PdsBlankLine):
-            return f"__BLANK_L{node.line_number}"
-        return f"__UNKEYED_L{node.line_number}_{hash(node.raw_line.strip())}"
+            # If the comment is identical across all three versions (and not an active change),
+            # we might want to filter it out here. This is a heuristic.
+            # For now, let's always return an identifier so they are part of the diff if they differ.
+            return f"__COMMENT_{hash(node.comment_text if hasattr(node, 'comment_text') else node.raw_line.strip())}"
+        elif isinstance(node, PdsBlankLine):
+            # Same for blank lines: an empty blank line is identical to another empty blank line.
+            # We filter identical ones for cleaner diffs.
+            # If a blank line is 'ADDED' or 'DELETED' in only one version, it will still get diffed.
+            return "__BLANK_LINE_IDENTICAL" # All identical blank lines have the same ID to align them
+
+        # Fallback for any other unkeyed node types, using hash of stripped raw_line for uniqueness
+        return f"__UNKEYED_{hash(node.raw_line.strip())}" 
 
     def _get_display_key(self, identifier_from_map, old_node, mod_node, new_node, index_in_all_identifiers):
+        """Gets the key/identifier to display in the PdsChange object's path."""
+        # Prioritize key from an existing node if available
         for node in [old_node, mod_node, new_node]:
             if node and hasattr(node, 'key'):
                 return node.key
         
+        # Fallback for non-keyed nodes, use a more descriptive placeholder
         display_node = next((n for n in [old_node, mod_node, new_node] if n is not None), None)
         if display_node:
             if isinstance(display_node, PdsComment):
-                return f"Comment@L{display_node.line_number}"
+                # Use a snippet of the comment text for display, not the internal hash
+                text = display_node.comment_text if hasattr(display_node, 'comment_text') else display_node.raw_line.strip()
+                return f"Comment:'{text[:15]}...'" if len(text) > 15 else f"Comment:'{text}'"
             if isinstance(display_node, PdsBlankLine):
-                return f"BlankLine@L{display_node.line_number}"
+                return "BlankLine" # Simple string for display
             raw_strip = display_node.raw_line.strip()
-            if raw_strip == "}": return "ClosingBrace"
-            return f"Item@{display_node.line_number}({raw_strip[:15].replace('.', '_')})"
-        
-        if isinstance(identifier_from_map, str) and not identifier_from_map.startswith("__"):
-            return identifier_from_map
+            if raw_strip == "}": return "ClosingBrace" # This is unlikely to be an identifier leading to a change object.
+            return f"UnkeyedItem({raw_strip[:15].replace('.', '_')})" # Generic item
+            
+        # If no node found, or if identifier itself is a filtered type
+        if identifier_from_map and isinstance(identifier_from_map, str) and not identifier_from_map.startswith("__"):
+            return identifier_from_map 
 
-        return f"ItemAtIndex_{index_in_all_identifiers}"
+        return f"ItemAtIndex_{index_in_all_identifiers}" # Last resort
 
     def _are_nodes_structurally_different(self, node1, node2):
-        if type(node1) != type(node2): return True
+        if type(node1) != type(node2): return True 
+
         if isinstance(node1, PdsKeyValuePair):
-            return (node1.key != node2.key or str(node1.value) != str(node2.value) or node1.comment_text_on_line != node2.comment_text_on_line)
+            return (node1.key != node2.key or
+                    str(node1.value) != str(node2.value) or 
+                    node1.comment_text_on_line != node2.comment_text_on_line) 
         elif isinstance(node1, PdsList):
-            return (node1.key != node2.key or node1.values != node2.values or node1.comment_text_on_line != node2.comment_text_on_line)
+            return (node1.key != node2.key or
+                    node1.values != node2.values or 
+                    node1.comment_text_on_line != node2.comment_text_on_line)
         elif isinstance(node1, PdsBlock):
-            return (node1.key != node2.key or node1.comment_text_on_line != node2.comment_text_on_line)
+            return (node1.key != node2.key or
+                    node1.comment_text_on_line != node2.comment_text_on_line)
         elif isinstance(node1, PdsComment):
-            return node1.comment_text != node2.comment_text
+            # Compare the actual comment text content
+            return (node1.comment_text if hasattr(node1, 'comment_text') else node1.raw_line.strip()) != \
+                   (node2.comment_text if hasattr(node2, 'comment_text') else node2.raw_line.strip())
         elif isinstance(node1, PdsBlankLine):
-            return False
+            return False # All blank lines are considered structurally identical in content
+
         if hasattr(node1, 'raw_line') and hasattr(node2, 'raw_line'):
             return node1.raw_line.strip() != node2.raw_line.strip()
-        return False
+
+        return False # Assume identical if unhandled type but same type
 
     def _compare_presence_and_content(self, node_ref, node_comp):
-        if node_ref is None and node_comp is None: return 'ABSENT'
-        if node_ref is None and node_comp is not None: return 'ADDED'
-        if node_ref is not None and node_comp is None: return 'DELETED'
+        if node_ref is None and node_comp is None: return 'ABSENT' 
+        if node_ref is None and node_comp is not None: return 'ADDED' 
+        if node_ref is not None and node_comp is None: return 'DELETED' 
         
         if self._are_nodes_structurally_different(node_ref, node_comp):
             return 'MODIFIED'

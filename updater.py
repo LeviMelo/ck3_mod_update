@@ -1,45 +1,41 @@
 # -----------------------------------------------------------------------------
-# Crusader Kings III Mod Updater Script (v12.2 - Restored Core Parsers, Block Logic, Targeted Nested Fix)
+# Crusader Kings III Mod Updater Script (v13.1 - Enhanced File Filtering, Error Handling)
 # -----------------------------------------------------------------------------
 # Author: AI Assistant (with extensive user feedback & apologies)
-# Date: 2025-05-25
+# Date: 2025-05-26
 #
 # Purpose:
 # Compares a CK3 mod against an old vanilla version (its base) and a new
-# vanilla version (target for update). It focuses on identifying entire
-# top-level blocks that were added or modified by the user. For modified blocks,
-# it allows the user to replace the new vanilla block with their version.
-# It includes a specific, more granular mechanism for adding a known nested
-# parameter (like 'diplomatic_range_mult' in 'character_modifier' within
-# 'innovation_longboats'), attempting to place it correctly.
+# vanilla version (target for update). It now uses a robust tree-based parser
+# and a 3-way diffing algorithm to identify granular changes and conflicts.
+# It provides interactive prompts for user resolution of conflicts and
+# application of mod-specific changes.
 #
 # Key Features:
-# 1. Identifies user's changes by comparing mod source to old vanilla,
-#    focusing on added files, added top-level entries, or modified top-level entries.
-# 2. For each changed file:
-#    a. Prompts user to process the ENTIRE FILE or skip it after a summary of block changes.
-# 3. If user proceeds with a file:
-#    a. For ADDED ENTRIES: Prompts to append the new entry (entire block).
-#    b. For MODIFIED ENTRIES (General): Displays mod's block vs. new vanilla's block,
-#       prompts user to replace new vanilla block with mod's version.
-#    c. Special handling for 'innovation_longboats' to offer adding
-#       'diplomatic_range_mult' into its 'character_modifier' sub-block.
-# 4. Adds in-line comments to modified/added lines/blocks.
-# 5. Creates a new output mod folder. Originals are NEVER modified.
+# 1. Uses a custom parser (pds_parser.py) to represent CK3 script files as a tree.
+# 2. Employs a 3-way diff (mod vs old_vanilla vs new_vanilla) to categorize changes.
+# 3. **Improved file filtering**: Only processes files where YOUR MOD has actually changed them (M vs O).
+# 4. Interactive CLI prompts for resolving conflicts and applying mod changes.
+# 5. Adds in-line comments to merged/added nodes for traceability.
+# 6. Creates a new output mod folder. Originals are NEVER modified.
 # -----------------------------------------------------------------------------
 
 import os
 import re
 import shutil
-import filecmp
+import filecmp # Used for efficient file-level comparison
 from datetime import datetime, timezone
+
+# Import our new core components
+from pds_parser import PdsParser, PdsBlock, PdsKeyValuePair, PdsList, PdsComment, PdsBlankLine
+from pds_differ import PdsDiffer, PdsChange
 
 # --- CONFIGURATION ---
 MOD_SOURCE_DIR = r"C:\Users\Galaxy\Documents\Paradox Interactive\Crusader Kings III\mod\custom_changes"
 OLD_VANILLA_DIR_REFERENCE = r"C:\Users\Galaxy\LEVI\jupyter\ck3_mod_update\old_ver"
 GAME_VANILLA_DIR_NEW = r"C:\Program Files (x86)\Steam\steamapps\common\Crusader Kings III\game"
-OUTPUT_SUBFOLDER_NAME = "updated_mod_v12_2_core_fix"
-FOLDERS_TO_PROCESS = ["common", "events"]
+OUTPUT_SUBFOLDER_NAME = "updated_mod_v13_1_tree_merge" # Updated version name
+FOLDERS_TO_PROCESS = ["common", "events"] # Consider adding "localization", "gui", etc. if needed
 # --- END CONFIGURATION ---
 
 # --- Global Variables ---
@@ -47,424 +43,446 @@ SCRIPT_EXECUTION_DIR = os.getcwd()
 MOD_OUTPUT_DIR = os.path.join(SCRIPT_EXECUTION_DIR, OUTPUT_SUBFOLDER_NAME)
 
 # --- Interaction Control Flags ---
-AUTO_PROCESS_ALL_FILES_SESSION = False
-AUTO_APPLY_ALL_CHANGES_THIS_FILE = False
-AUTO_APPLY_ALL_CHANGES_SESSION = False
+# These flags now control automatic decisions across files or within a single file
+AUTO_PROCESS_ALL_FILES_SESSION = False # Auto-proceed with file processing summary
+AUTO_APPLY_ALL_CHANGES_THIS_FILE = False # Auto-apply all changes within current file
+AUTO_APPLY_ALL_CHANGES_SESSION = False # Auto-apply all changes for all files in session
 
 # --- Helper Functions ---
 def log_message(message, level="INFO", indent=0):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    indent_space = "  " * indent; level_str = f"[{level.upper():<7}]"
+    indent_space = "    " * indent
+    # Custom levels for better output formatting
+    level_str = f"[{level.upper():<10}]" if level in ["INFO", "WARN", "ERROR", "FATAL"] \
+                else f"[{level.upper():<10}]"
     print(f"{timestamp} {level_str} {indent_space}{message}")
 
-def get_user_confirmation(prompt_message, prompt_level="param_apply", default_choice_on_conflict=None):
+def get_user_confirmation(prompt_message, prompt_level="param_apply"):
     global AUTO_PROCESS_ALL_FILES_SESSION, AUTO_APPLY_ALL_CHANGES_THIS_FILE, AUTO_APPLY_ALL_CHANGES_SESSION
-    if prompt_level == "file_process_summary" and AUTO_PROCESS_ALL_FILES_SESSION: return "yes"
-    if prompt_level in ["block_replace", "entry_add", "param_add_specific"]:
-        if AUTO_APPLY_ALL_CHANGES_THIS_FILE: return "yes"
-        if AUTO_APPLY_ALL_CHANGES_SESSION: return "yes"
+
+    # Auto-responses based on flags
+    if prompt_level == "file_process_summary" and AUTO_PROCESS_ALL_FILES_SESSION:
+        return "yes"
+    if prompt_level in ["block_replace", "entry_add", "param_add_specific", "conflict_resolution", "delete_confirm"]:
+        if AUTO_APPLY_ALL_CHANGES_THIS_FILE:
+            return "yes"
+        if AUTO_APPLY_ALL_CHANGES_SESSION:
+            return "yes"
 
     base_options_text = "(y[es]/n[o]"
     if prompt_level == "file_process_summary":
         options_text = f"{base_options_text}/S[kip ALL file summaries & auto-process files])"
-    elif prompt_level in ["block_replace", "entry_add", "param_add_specific"]:
+    elif prompt_level in ["block_replace", "entry_add", "param_add_specific", "conflict_resolution", "delete_confirm"]:
         options_text = f"{base_options_text}/a[pply ALL for current file]/s[kip ALL change confirmations for session])"
-    else: options_text = f"{base_options_text})"
+    else:
+        options_text = f"{base_options_text})"
 
     while True:
-        full_prompt = f"[PROMPT ] {prompt_message} {options_text}: "
+        full_prompt = f"[PROMPT    ] {prompt_message} {options_text}: "
         response = input(full_prompt).strip().lower()
         if response in ["yes", "y"]: return "yes"
         if response in ["no", "n"]: return "no"
-        # Removed default_choice_on_conflict for now as block prompts are simpler y/n
         if prompt_level == "file_process_summary":
-            if response in ["s", "skipallfiles"]: AUTO_PROCESS_ALL_FILES_SESSION = True; return "yes"
-        elif prompt_level in ["block_replace", "entry_add", "param_add_specific"]:
-            if response in ["a", "applyall"]: AUTO_APPLY_ALL_CHANGES_THIS_FILE = True; return "yes"
-            if response in ["s", "skipall", "skipallconfirmations"]: AUTO_APPLY_ALL_CHANGES_SESSION = True; return "yes"
-        print("[ERROR  ] Invalid input.")
+            if response in ["s", "skipallfiles"]:
+                AUTO_PROCESS_ALL_FILES_SESSION = True
+                return "yes"
+        elif prompt_level in ["block_replace", "entry_add", "param_add_specific", "conflict_resolution", "delete_confirm"]:
+            if response in ["a", "applyall"]:
+                AUTO_APPLY_ALL_CHANGES_THIS_FILE = True
+                return "yes"
+            if response in ["s", "skipall", "skipallconfirmations"]:
+                AUTO_APPLY_ALL_CHANGES_SESSION = True
+                return "yes"
+        log_message("Invalid input. Please enter 'y', 'n', 'a', or 's'.", "ERROR", 1)
 
-def get_file_lines(filepath, context="reading file"):
-    try:
-        with open(filepath, 'r', encoding='utf-8-sig') as f: return f.readlines()
-    except UnicodeDecodeError:
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f: return f.readlines()
-        except Exception as e_inner: log_message(f"ReadErr '{filepath}' ({context}): {e_inner}", "ERROR",1); return None
-    except FileNotFoundError: log_message(f"NotFound '{filepath}' ({context})", "WARN ",1); return None
-    except Exception as e: log_message(f"ReadErr '{filepath}' ({context}): {e}", "ERROR",1); return None
+# PdsDiffer instance is passed to these functions
+def find_node_by_path(root_nodes, key_path, differ_util):
+    """
+    Traverses the tree to find a node given its full key_path.
+    root_nodes: list of PdsNode objects (top-level nodes in a file)
+    key_path: list of strings, e.g., ['witch.1001', 'trigger', 'is_witch_trigger']
+    differ_util: An instance of PdsDiffer to get node identifiers.
+    """
+    if not key_path:
+        return None
 
-def write_file_lines(filepath, lines):
-    try:
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, 'w', encoding='utf-8-sig') as f: f.writelines(lines)
-        return True
-    except Exception as e: log_message(f"WriteErr '{filepath}': {e}", "ERROR",1); return False
+    current_nodes = root_nodes
+    target_node = None
 
-# --- START OF RESTORED/CORRECTED PARSING HELPER FUNCTIONS ---
-def parse_parameter_line(line_text):
-    stripped_line = line_text.strip()
-    original_comment = ""
-    if '#' in stripped_line:
-        parts = stripped_line.split('#', 1)
-        effective_line_part = parts[0].strip()
-        if len(parts) > 1: original_comment = parts[1].strip()
-    else:
-        effective_line_part = stripped_line
+    for i, segment in enumerate(key_path):
+        found_in_current_level = False
+        for node in current_nodes:
+            if differ_util._get_node_identifier(node) == segment:
+                if i == len(key_path) - 1: # This is the final node
+                    target_node = node
+                    found_in_current_level = True
+                    break
+                elif isinstance(node, PdsBlock): # Not final, but can recurse into its children
+                    current_nodes = node.children
+                    found_in_current_level = True
+                    break
+                else: # Segment found, but it's not a block and not the final node
+                    return None # Path broken
+        if not found_in_current_level:
+            return None # Segment not found at this level
+    return target_node
+
+def get_parent_node_by_path(root_nodes, key_path, differ_util):
+    """
+    Traverses the tree to find the parent node given a child's full key_path.
+    Returns (parent_node, child_identifier_in_parent).
+    differ_util: An instance of PdsDiffer to get node identifiers.
+    """
+    if not key_path or len(key_path) < 1:
+        return None, None
     
-    if not effective_line_part: # Line was empty or only a comment
-        return None, None, False, original_comment
+    if len(key_path) == 1: # Top-level node, parent is effectively the file root list
+        return root_nodes, key_path[0] # Return list itself and identifier
 
-    # Regex allows @ in keys, and dots/dashes.
-    match = re.match(r'^\s*([@\w\.-]+)\s*=\s*(.+)$', effective_line_part)
-    if match:
-        key, value_str = match.group(1), match.group(2).strip()
-        # A value is "not simple" if it IS a block start or a full block itself.
-        is_simple = True 
-        if value_str == "{": is_simple = False 
-        elif value_str.startswith("{") and value_str.endswith("}") and value_str != "{}":
-            # If it contains internal structure (more braces or assignments), it's not simple for value replacement
-            if '=' in value_str[1:-1] or '{' in value_str[1:-1]: is_simple = False
-        return key, value_str, is_simple, original_comment
-    return None, None, False, original_comment # Not a 'key = value' line
+    parent_path = key_path[:-1]
+    child_identifier = key_path[-1]
 
-def find_entry_block_indices(entry_name_or_regex, content_lines, start_search_from_idx=0, is_regex=False):
-    """Finds start/end line indices of an entry: entry_name = { ... } or regex match for key"""
-    block_start_idx, brace_level = -1, 0
+    parent_block = find_node_by_path(root_nodes, parent_path, differ_util)
+    if isinstance(parent_block, PdsBlock): # Parent must be a block to manipulate children
+        return parent_block, child_identifier
+    return None, None # Parent not found or not a block
+
+# --- Core Merge Function ---
+def process_single_file_merge(mod_rel_path, differ_instance):
+    """
+    Orchestrates the 3-way diff, interactive conflict resolution,
+    and modification of the New Vanilla tree for a single file.
+    """
+    log_message(f"Processing file: '{mod_rel_path}'", "HEADER")
+    global AUTO_APPLY_ALL_CHANGES_THIS_FILE # Reset for each file
+    AUTO_APPLY_ALL_CHANGES_THIS_FILE = False
+
+    mod_abs_path = os.path.join(MOD_SOURCE_DIR, mod_rel_path)
+    old_vanilla_abs_path = os.path.join(OLD_VANILLA_DIR_REFERENCE, mod_rel_path)
+    new_vanilla_abs_path = os.path.join(GAME_VANILLA_DIR_NEW, mod_rel_path)
+    output_abs_path = os.path.join(MOD_OUTPUT_DIR, mod_rel_path)
+
+    parser = PdsParser() # PdsParser can be instantiated per file as it manages internal state
+
+    # Load and parse all three versions
+    log_message("Loading file versions...", "INFO", 1)
+    old_nodes = parser.parse_file(old_vanilla_abs_path)
+    mod_nodes = parser.parse_file(mod_abs_path)
+    new_nodes = parser.parse_file(new_vanilla_abs_path)
+
+    if not new_nodes:
+        log_message(f"New Vanilla file '{mod_rel_path}' not found or empty. Cannot merge.", "WARN", 1)
+        # If NV doesn't exist, and Mod doesn't exist relative to Old, skip.
+        # If Mod exists and NV doesn't, this means Mod added a file that NV deleted.
+        if mod_nodes: # This is a file that existed in MOD_SOURCE but not in NEW_VANILLA
+            prompt = f"Mod file '{mod_rel_path}' exists, but New Vanilla deleted it. Copy your mod's file as is?"
+            if get_user_confirmation(prompt, prompt_level="file_process_summary") == "yes":
+                os.makedirs(os.path.dirname(output_abs_path), exist_ok=True)
+                shutil.copy2(mod_abs_path, output_abs_path)
+                log_message(f"Copied '{mod_rel_path}' from mod source.", "SUCCESS", 2)
+            else:
+                log_message(f"Skipped copying mod file '{mod_rel_path}'.", "INFO", 2)
+        return False # Indicate file was not merged into NV base
+
+    # Create a deep copy of the new_nodes to apply changes to
+    modified_output_nodes = [node.copy() for node in new_nodes]
+    file_was_modified_by_script = False
+
+    # Get changes from the differ
+    changes = differ_instance.diff_nodes(old_nodes, mod_nodes, new_nodes)
+
+    if not changes:
+        log_message(f"No detected changes for '{mod_rel_path}'. Copying New Vanilla as is.", "INFO", 1)
+        os.makedirs(os.path.dirname(output_abs_path), exist_ok=True)
+        shutil.copy2(new_vanilla_abs_path, output_abs_path)
+        return True # Indicate successful processing, even if just copy
+
+    log_message(f"'{mod_rel_path}' has {len(changes)} detected changes:", "INFO", 1)
+    for i, change in enumerate(changes):
+        log_message(f"  Change {i+1}: {change.type:<25} at {'.'.join(change.key_path)}", "DETAIL", 2)
     
-    entry_start_regex = None
-    if not is_regex:
-        entry_start_regex = re.compile(r"^\s*" + re.escape(entry_name_or_regex) + r"\s*=\s*\{")
-    else: 
-        entry_start_regex = entry_name_or_regex
+    prompt_file_msg = f"Proceed with processing '{mod_rel_path}' with {len(changes)} detected changes?"
+    if get_user_confirmation(prompt_file_msg, prompt_level="file_process_summary") == "no":
+        log_message(f"Skipping file '{mod_rel_path}' by user choice. No output generated.", "INFO", 1)
+        return False
 
-    for i in range(start_search_from_idx, len(content_lines)):
-        line = content_lines[i]
-        stripped_line = line.strip() 
+    # --- Apply Changes Interactively ---
+    log_message("Applying changes interactively...", "PHASE", 1)
+    
+    # Iterate through changes and apply/resolve
+    for i, change in enumerate(changes):
+        log_message(f"\n--- Change {i+1}/{len(changes)}: {change.type} at {'.'.join(change.key_path)} ---", "INFO", 2)
+        log_message(f"  Parent context: {'.'.join(change.context_parent_path) if change.context_parent_path else 'ROOT'}", "DETAIL", 3)
+
+        # --- Display Nodes for Context ---
+        log_message("  OLD VANILLA:", "DETAIL", 3)
+        if change.old_node: 
+            # Fix: Use PdsParser._nodes_to_string() and capture the actual text
+            # Ensure it only prints the node itself and its immediate content
+            print("    " + PdsParser._nodes_to_string([change.old_node]).strip())
+        else: 
+            print("    ABSENT")
         
-        if block_start_idx == -1:
-            match_obj = entry_start_regex.match(stripped_line) 
-            if match_obj:
-                block_start_idx = i
-                # Correctly count braces only from the line where the block starts
-                brace_level = line.count('{') - line.count('}')
-                if brace_level <= 0: # Handles single-line blocks or errors
-                    if stripped_line.endswith("}") and line.count('{') == line.count('}'): 
-                        return block_start_idx, i 
-                    block_start_idx = -1 # Reset, not a valid start for a multi-line block
-        elif block_start_idx != -1: # Inside a block
-            brace_level += line.count('{')
-            brace_level -= line.count('}')
-            if brace_level <= 0: 
-                return block_start_idx, i
-    return None, None
+        log_message("  YOUR MOD:", "DETAIL", 3)
+        if change.mod_node: 
+            print("    " + PdsParser._nodes_to_string([change.mod_node]).strip())
+        else: 
+            print("    ABSENT")
 
-def get_parameters_within_block(content_lines, block_start_idx, block_end_idx):
-    params = {} # key: (value_str, original_comment_str)
-    if block_start_idx is None or block_start_idx >= block_end_idx: return params
-    for i in range(block_start_idx + 1, block_end_idx): # Iterate lines *inside* the main block braces
-        param_key, param_value, is_simple, comment = parse_parameter_line(content_lines[i])
-        if param_key and is_simple: # Only store if identified as a simple parameter
-            params[param_key] = (param_value, comment)
-    return params
-# --- END RESTORED PARSING HELPER FUNCTIONS ---
+        log_message("  NEW VANILLA:", "DETAIL", 3)
+        if change.new_node: 
+            print("    " + PdsParser._nodes_to_string([change.new_node]).strip())
+        else: 
+            print("    ABSENT")
 
-
-# --- Phase 1: Identify Changed/Added Top-Level Blocks (Mod vs OLD VANILLA) ---
-def identify_block_level_actions():
-    log_message("Phase 1: Identifying changed/added top-level blocks (Mod vs OLD VANILLA)...", "PHASE")
-    all_potential_actions = {}
-    entry_regex = re.compile(r"^\s*([@\w\.-]+)\s*=\s*\{") # Includes @ for keys
-    files_with_actions = 0
-
-    for folder_name in FOLDERS_TO_PROCESS:
-        mod_folder = os.path.join(MOD_SOURCE_DIR, folder_name)
-        old_vanilla_folder = os.path.join(OLD_VANILLA_DIR_REFERENCE, folder_name)
-        log_message(f"Scanning folder: '{folder_name}'", "INFO", 1)
-
-        if not os.path.isdir(mod_folder): continue
-
-        for root, _, files in os.walk(mod_folder):
-            for filename in files:
-                if not filename.lower().endswith(".txt"): continue
-                
-                mod_rel_path = os.path.relpath(os.path.join(root, filename), MOD_SOURCE_DIR)
-                mod_abs_path = os.path.join(MOD_SOURCE_DIR, mod_rel_path)
-                old_vanilla_abs_path = os.path.join(OLD_VANILLA_DIR_REFERENCE, mod_rel_path)
-                
-                file_actions_list = []
-                mod_lines = get_file_lines(mod_abs_path, f"reading mod file '{mod_rel_path}'")
-                if not mod_lines: continue
-
-                if not os.path.exists(old_vanilla_abs_path) or not os.path.isdir(old_vanilla_folder) :
-                    all_potential_actions[mod_rel_path] = {
-                        'file_type': 'new_by_mod', 'content_if_new': "".join(mod_lines)
-                    }
-                    log_message(f"File '{mod_rel_path}' is NEW in mod (or Old Vanilla path missing).", "DETAIL", 2)
-                    files_with_actions +=1
-                    continue 
-                
-                if filecmp.cmp(mod_abs_path, old_vanilla_abs_path, shallow=False):
-                    log_message(f"File '{mod_rel_path}' is identical to Old Vanilla. No changes by you.", "DEBUG", 2)
-                    continue
-
-                log_message(f"File '{mod_rel_path}' differs from Old Vanilla. Analyzing entries...", "INFO", 2)
-                old_vanilla_lines = get_file_lines(old_vanilla_abs_path, f"reading old vanilla '{mod_rel_path}'")
-                if not old_vanilla_lines: continue
-
-                mod_entries = {} 
-                idx = 0
-                while idx < len(mod_lines):
-                    match = entry_regex.match(mod_lines[idx].strip())
-                    if match:
-                        entry_name = match.group(1)
-                        e_start, e_end = find_entry_block_indices(entry_name, mod_lines, idx)
-                        if e_start is not None:
-                            mod_entries[entry_name] = mod_lines[e_start : e_end+1]
-                            idx = e_end + 1
-                            continue
-                    idx += 1
-                
-                old_van_entries = {}
-                idx = 0
-                while idx < len(old_vanilla_lines):
-                    match = entry_regex.match(old_vanilla_lines[idx].strip())
-                    if match:
-                        entry_name = match.group(1)
-                        e_start, e_end = find_entry_block_indices(entry_name, old_vanilla_lines, idx)
-                        if e_start is not None:
-                            old_van_entries[entry_name] = old_vanilla_lines[e_start : e_end+1]
-                            idx = e_end + 1
-                            continue
-                    idx += 1
-
-                for entry_name, mod_block_lines in mod_entries.items():
-                    if entry_name not in old_van_entries:
-                        file_actions_list.append({
-                            'type': 'entry_added', 'entry_name': entry_name,
-                            'mod_block_lines': mod_block_lines
-                        })
-                    elif mod_block_lines != old_van_entries[entry_name]: 
-                        file_actions_list.append({
-                            'type': 'entry_modified', 'entry_name': entry_name,
-                            'mod_block_lines': mod_block_lines,
-                            'old_van_block_lines': old_van_entries[entry_name] # Keep for reference if needed
-                        })
-                
-                if file_actions_list:
-                    all_potential_actions[mod_rel_path] = {
-                        'file_type': 'modified_vanilla', 'changes': file_actions_list
-                    }
-                    files_with_actions +=1
-                else: 
-                    log_message(f"File '{mod_rel_path}' differs textually but no top-level block changes/additions parsed.", "WARN ", 3)
-    
-    log_message(f"Phase 1 Summary: Identified block-level actions for {files_with_actions} files.", "PHASE")
-    return all_potential_actions
-
-# --- Phase 2: Apply Block-Level Changes and Targeted Param Adds to NEW VANILLA ---
-def apply_block_changes_and_targeted_adds(potential_actions_map):
-    log_message("Phase 2: Applying block changes and targeted param adds...", "PHASE")
-    summary = {k: 0 for k in [
-        "files_written", "blocks_replaced_by_mod", "blocks_kept_nv",
-        "entries_appended_by_mod", "entries_skipped_by_user",
-        "custom_files_copied", "custom_files_skipped_user",
-        "targeted_param_added", "targeted_param_add_skipped", "targeted_param_modified", "targeted_param_modification_skipped",
-        "warn_nv_file_missing", "warn_entry_missing_nv_for_mod_block", "warn_sub_block_missing_nv",
-        "files_mod_eq_nv_skipped_auto", "files_skipped_at_file_prompt"
-    ]}
-    global AUTO_APPLY_ALL_CHANGES_THIS_FILE
-
-    if not potential_actions_map:
-        log_message("No potential actions from Phase 1.", "INFO", 1); return summary
-
-    for mod_rel_path, action_details in potential_actions_map.items():
-        AUTO_APPLY_ALL_CHANGES_THIS_FILE = False
-        log_message(f"Reviewing File: '{mod_rel_path}'", "HEADER")
-        output_abs_path = os.path.join(MOD_OUTPUT_DIR, mod_rel_path) # Defined here
-
-        if action_details['file_type'] == 'new_by_mod':
-            prompt_msg = f"File '{mod_rel_path}' was created by your mod. Copy to updated mod?"
-            if get_user_confirmation(prompt_msg, prompt_level="entry_add") == "yes":
-                content_str = action_details['content_if_new']
-                if write_file_lines(output_abs_path, content_str.splitlines(True)):
-                    summary["files_written"] += 1; summary["custom_files_copied"] += 1
-            else: summary["custom_files_skipped_user"] +=1
+        # --- Get Parent Node for Manipulation ---
+        # Pass differ_instance to helper functions
+        parent_for_manipulation, child_identifier_in_parent = get_parent_node_by_path(modified_output_nodes, change.key_path, differ_instance)
+        
+        if parent_for_manipulation is None:
+            log_message(f"WARNING: Could not find parent for '{'.'.join(change.key_path)}' in output tree. Skipping this change.", "ERROR", 3)
             continue
-
-        new_vanilla_abs_path = os.path.join(GAME_VANILLA_DIR_NEW, mod_rel_path)
-        mod_source_abs_path = os.path.join(MOD_SOURCE_DIR, mod_rel_path)
-
-        if not os.path.exists(new_vanilla_abs_path):
-            log_message(f"NEW VANILLA for '{mod_rel_path}' NOT found. Skipping.", "WARN ", 1)
-            summary["warn_nv_file_missing"] += 1; continue
         
-        if os.path.exists(mod_source_abs_path) and filecmp.cmp(mod_source_abs_path, new_vanilla_abs_path, shallow=False):
-            log_message(f"Your modded file '{mod_rel_path}' is ALREADY IDENTICAL to NEW VANILLA. Skipping.", "INFO", 1)
-            summary["files_mod_eq_nv_skipped_auto"] +=1; continue
+        # --- Decision Logic ---
+        # All changes made to modified_output_nodes should involve .copy() of chosen node
+        # Add comment for traceability
+        timestamp_comment = datetime.now(timezone.utc).strftime("ScriptMerged:%Y%m%d%H%M%SZ")
 
-        new_vanilla_lines_base = get_file_lines(new_vanilla_abs_path, "reading new vanilla base")
-        if not new_vanilla_lines_base: continue
+        if change.type == 'MOD_ADDED':
+            prompt = f"Mod added '{change.mod_node.key}'. Append to New Vanilla?"
+            if get_user_confirmation(prompt, prompt_level="entry_add") == "yes":
+                new_node_to_add = change.mod_node.copy()
+                if isinstance(new_node_to_add, PdsKeyValuePair):
+                    new_node_to_add.comment_text_on_line = (f"{new_node_to_add.comment_text_on_line} {timestamp_comment} MOD_ADDED" if new_node_to_add.comment_text_on_line else timestamp_comment + " MOD_ADDED")
+                elif isinstance(new_node_to_add, PdsBlock):
+                     new_node_to_add.comment_text_on_line = (f"{new_node_to_add.comment_text_on_line} {timestamp_comment} MOD_ADDED" if new_node_to_add.comment_text_on_line else timestamp_comment + " MOD_ADDED")
+                
+                if isinstance(parent_for_manipulation, list): # Root level addition
+                    parent_for_manipulation.append(new_node_to_add)
+                else: # Nested addition
+                    parent_for_manipulation.add_child_at_appropriate_location(new_node_to_add)
+                log_message(f"Added mod's '{change.mod_node.key}'.", "SUCCESS", 4)
+                file_was_modified_by_script = True
+            else:
+                log_message(f"Skipped adding mod's '{change.mod_node.key}'.", "INFO", 4)
 
-        changes_in_file = action_details.get('changes', [])
-        if not changes_in_file:
-            log_message(f"No specific block changes identified by Phase 1 for '{mod_rel_path}', though files differ. Manual review advised.", "INFO", 1)
-            continue
+        elif change.type == 'VANILLA_ADDED':
+            log_message(f"Vanilla added '{change.new_node.key}'. Automatically applying.", "INFO", 3)
+            # It's already in modified_output_nodes (which is a copy of new_nodes), so no action needed.
+            # However, if the node was a comment/blank and we were tracking its path via hash/line number
+            # we should ensure it's there. For now, assume it's correctly in the base.
+            pass # No direct action needed, it's already in our base output tree.
 
-        log_message(f"File '{mod_rel_path}' has ~{len(changes_in_file)} modified/added top-level entries (Mod vs OldVanilla):", "INFO", 1)
-        for i, change in enumerate(changes_in_file):
-            log_message(f"  Change {i+1}: Type='{change['type']}', Entry='{change['entry_name']}'", "DETAIL", 2)
+        elif change.type == 'MOD_MODIFIED':
+            prompt = f"Mod modified '{change.mod_node.key}'. Replace New Vanilla's version with Mod's?"
+            if get_user_confirmation(prompt, prompt_level="block_replace") == "yes":
+                chosen_node = change.mod_node.copy()
+                if isinstance(chosen_node, PdsKeyValuePair):
+                    chosen_node.comment_text_on_line = (f"{chosen_node.comment_text_on_line} {timestamp_comment} MOD_MODIFIED" if chosen_node.comment_text_on_line else timestamp_comment + " MOD_MODIFIED")
+                elif isinstance(chosen_node, PdsBlock):
+                     chosen_node.comment_text_on_line = (f"{chosen_node.comment_text_on_line} {timestamp_comment} MOD_MODIFIED" if chosen_node.comment_text_on_line else timestamp_comment + " MOD_MODIFIED")
+
+                if isinstance(parent_for_manipulation, list): # Root level modification
+                    for idx, node in enumerate(parent_for_manipulation):
+                        if differ_instance._get_node_identifier(node) == child_identifier_in_parent:
+                            parent_for_manipulation[idx] = chosen_node
+                            break
+                else: # Nested modification
+                    parent_for_manipulation.replace_child(child_identifier_in_parent, chosen_node)
+                log_message(f"Applied mod's modified '{change.mod_node.key}'.", "SUCCESS", 4)
+                file_was_modified_by_script = True
+            else:
+                log_message(f"Kept New Vanilla's version of '{change.new_node.key}'.", "INFO", 4)
+
+        elif change.type == 'VANILLA_MODIFIED':
+            log_message(f"Vanilla modified '{change.new_node.key}'. Automatically keeping New Vanilla's version.", "INFO", 3)
+            pass # No action needed, as modified_output_nodes started as a copy of new_nodes
+
+        elif change.type == 'CONFLICT_MODIFIED':
+            log_message(f"Conflict: Both Mod and Vanilla modified '{change.key_path[-1]}'.", "WARN", 3)
+            log_message("Options:", "INFO", 4)
+            log_message("  1. Keep YOUR MOD's version", "INFO", 4)
+            log_message("  2. Keep NEW VANILLA's version", "INFO", 4)
+            log_message("  3. Skip (manual merge later)", "INFO", 4)
+            choice = input("[PROMPT    ] Enter your choice (1/2/3): ").strip()
+
+            chosen_node = None
+            if choice == '1':
+                chosen_node = change.mod_node.copy()
+                log_message("User chose: Keep YOUR MOD's version.", "INFO", 4)
+            elif choice == '2':
+                chosen_node = change.new_node.copy()
+                log_message("User chose: Keep NEW VANILLA's version.", "INFO", 4)
+            else:
+                log_message("User chose: Skip this conflict. Manual merge needed for this entry.", "WARN", 4)
+                continue
+
+            if chosen_node:
+                if isinstance(chosen_node, PdsKeyValuePair):
+                    chosen_node.comment_text_on_line = (f"{chosen_node.comment_text_on_line} {timestamp_comment} CONFLICT_MODIFIED" if chosen_node.comment_text_on_line else timestamp_comment + " CONFLICT_MODIFIED")
+                elif isinstance(chosen_node, PdsBlock):
+                     chosen_node.comment_text_on_line = (f"{chosen_node.comment_text_on_line} {timestamp_comment} CONFLICT_MODIFIED" if chosen_node.comment_text_on_line else timestamp_comment + " CONFLICT_MODIFIED")
+
+                if isinstance(parent_for_manipulation, list): # Root level
+                    for idx, node in enumerate(parent_for_manipulation):
+                        if differ_instance._get_node_identifier(node) == child_identifier_in_parent:
+                            parent_for_manipulation[idx] = chosen_node
+                            break
+                else: # Nested
+                    parent_for_manipulation.replace_child(child_identifier_in_parent, chosen_node)
+                log_message(f"Applied chosen version for '{change.key_path[-1]}'.", "SUCCESS", 4)
+                file_was_modified_by_script = True
         
-        prompt_file_msg = f"Process file '{mod_rel_path}' with {len(changes_in_file)} entry changes detailed above?"
-        if get_user_confirmation(prompt_file_msg, prompt_level="file_process_summary") == "no":
-            log_message(f"Skipping file '{mod_rel_path}' by user choice.", "INFO", 1)
-            summary["files_skipped_at_file_prompt"] += 1; continue
+        elif change.type == 'CONFLICT_ADDITION':
+            log_message(f"Conflict: Both Mod and Vanilla added an item with the same identifier '{change.key_path[-1]}', but with different content.", "WARN", 3)
+            log_message("Options:", "INFO", 4)
+            log_message("  1. Keep YOUR MOD's version (will overwrite NV's added item)", "INFO", 4)
+            log_message("  2. Keep NEW VANILLA's version", "INFO", 4)
+            log_message("  3. Skip (manual merge later or keep both if IDs are actually unique)", "INFO", 4)
+            choice = input("[PROMPT    ] Enter your choice (1/2/3): ").strip()
+
+            chosen_node = None
+            if choice == '1':
+                chosen_node = change.mod_node.copy()
+                log_message("User chose: Keep YOUR MOD's added version.", "INFO", 4)
+            elif choice == '2':
+                chosen_node = change.new_node.copy()
+                log_message("User chose: Keep NEW VANILLA's added version.", "INFO", 4)
+            else:
+                log_message("User chose: Skip this conflict. Manual merge needed.", "WARN", 4)
+                continue
+
+            if chosen_node:
+                if isinstance(chosen_node, PdsKeyValuePair):
+                    chosen_node.comment_text_on_line = (f"{chosen_node.comment_text_on_line} {timestamp_comment} CONFLICT_ADDITION" if chosen_node.comment_text_on_line else timestamp_comment + " CONFLICT_ADDITION")
+                elif isinstance(chosen_node, PdsBlock):
+                     chosen_node.comment_text_on_line = (f"{chosen_node.comment_text_on_line} {timestamp_comment} CONFLICT_ADDITION" if chosen_node.comment_text_on_line else timestamp_comment + " CONFLICT_ADDITION")
+
+                # Remove NV's version first if it exists, then add the chosen_node
+                # This handles the case where NV already has the node, but we're replacing it with Mod's version.
+                # If NV's node wasn't added yet (because it was the 'other side' of the add conflict), this removal is a no-op.
+                if isinstance(parent_for_manipulation, list): # Root level
+                    parent_for_manipulation[:] = [
+                        n for n in parent_for_manipulation 
+                        if differ_instance._get_node_identifier(n) != child_identifier_in_parent
+                    ]
+                    parent_for_manipulation.append(chosen_node) # Add chosen node to root
+                else: # Nested
+                    # Try to replace if it exists, otherwise add. This assumes it's a replacement for an existing conflict.
+                    if not parent_for_manipulation.replace_child(child_identifier_in_parent, chosen_node):
+                        parent_for_manipulation.add_child_at_appropriate_location(chosen_node)
+
+                log_message(f"Applied chosen added version for '{change.key_path[-1]}'.", "SUCCESS", 4)
+                file_was_modified_by_script = True
+
+        elif change.type == 'CONFLICT_DELETION':
+            log_message(f"Conflict: Item '{change.key_path[-1]}' was deleted by one side and modified by the other.", "WARN", 3)
+            log_message("Options:", "INFO", 4)
+            log_message("  1. Keep Mod's deletion (remove the item)", "INFO", 4)
+            log_message("  2. Keep New Vanilla's version (restore/keep the item as NV has it)", "INFO", 4)
+            log_message("  3. Skip (manual merge later)", "INFO", 4)
+            choice = input("[PROMPT    ] Enter your choice (1/2/3): ").strip()
+
+            if choice == '1': # User chose to delete it (Mod's deletion)
+                if isinstance(parent_for_manipulation, list):
+                    parent_for_manipulation[:] = [
+                        n for n in parent_for_manipulation 
+                        if differ_instance._get_node_identifier(n) != child_identifier_in_parent
+                    ]
+                else:
+                    parent_for_manipulation.remove_child(child_identifier_in_parent)
+                log_message(f"Applied deletion for '{change.key_path[-1]}'.", "SUCCESS", 4)
+                file_was_modified_by_script = True
+            elif choice == '2': # User chose to keep NV's version
+                chosen_node = change.new_node.copy()
+                if isinstance(chosen_node, PdsKeyValuePair):
+                    chosen_node.comment_text_on_line = (f"{chosen_node.comment_text_on_line} {timestamp_comment} CONFLICT_DELETION_KEPT_NV" if chosen_node.comment_text_on_line else timestamp_comment + " CONFLICT_DELETION_KEPT_NV")
+                elif isinstance(chosen_node, PdsBlock):
+                     chosen_node.comment_text_on_line = (f"{chosen_node.comment_text_on_line} {timestamp_comment} CONFLICT_DELETION_KEPT_NV" if chosen_node.comment_text_on_line else timestamp_comment + " CONFLICT_DELETION_KEPT_NV")
+
+                if isinstance(parent_for_manipulation, list):
+                    for idx, node in enumerate(parent_for_manipulation):
+                        if differ_instance._get_node_identifier(node) == child_identifier_in_parent:
+                            parent_for_manipulation[idx] = chosen_node
+                            break
+                else:
+                    parent_for_manipulation.replace_child(child_identifier_in_parent, chosen_node)
+                log_message(f"Applied New Vanilla's version for '{change.key_path[-1]}'.", "SUCCESS", 4)
+                file_was_modified_by_script = True
+            else:
+                log_message("User chose: Skip this conflict. Manual merge needed.", "WARN", 4)
+                continue
+
+        elif change.type == 'MOD_DELETED':
+            prompt = f"Mod deleted '{change.old_node.key}'. Remove it from New Vanilla?"
+            if get_user_confirmation(prompt, prompt_level="delete_confirm") == "yes":
+                if isinstance(parent_for_manipulation, list):
+                    parent_for_manipulation[:] = [
+                        n for n in parent_for_manipulation 
+                        if differ_instance._get_node_identifier(n) != child_identifier_in_parent
+                    ]
+                else:
+                    parent_for_manipulation.remove_child(child_identifier_in_parent)
+                log_message(f"Removed '{change.old_node.key}' per mod's deletion.", "SUCCESS", 4)
+                file_was_modified_by_script = True
+            else:
+                log_message(f"Kept '{change.old_node.key}' in New Vanilla.", "INFO", 4)
         
-        output_lines = list(new_vanilla_lines_base) # Start with new vanilla for modifications
-        file_was_modified_by_script = False
-
-        for change_item in changes_in_file:
-            entry_name = change_item['entry_name']
-            action_type = change_item['type']
-
-            if action_type == 'entry_added':
-                mod_block_lines = change_item['mod_block_lines']
-                prompt_add = f"Entry '{entry_name}': Your mod ADDED this. Append to New Vanilla '{mod_rel_path}'?"
-                nv_entry_s_check, _ = find_entry_block_indices(entry_name, output_lines)
-                if nv_entry_s_check is not None:
-                    prompt_add += " (WARNING: Name conflicts with an existing New Vanilla entry!)"
-
-                if get_user_confirmation(prompt_add, prompt_level="entry_add") == "yes":
-                    log_message(f"Appending your new entry block '{entry_name}'.", "DETAIL", 2)
-                    if output_lines and not output_lines[-1].endswith(('\n','\r')): output_lines.append('\n')
-                    output_lines.append(f"\n# --- MODDED: Entry '{entry_name}' Added By Mod ---\n")
-                    output_lines.extend(mod_block_lines) # mod_block_lines already have newlines
-                    file_was_modified_by_script = True; summary["entries_appended_by_mod"] += 1
-                else: summary["entries_skipped_user"] +=1
-
-            elif action_type == 'entry_modified':
-                mod_block_lines_for_entry = change_item['mod_block_lines']
-                
-                # Find this entry in the current output_lines (which starts as new_vanilla_lines_base)
-                out_nv_entry_s, out_nv_entry_e = find_entry_block_indices(entry_name, output_lines)
-                
-                if out_nv_entry_s is None:
-                    log_message(f"Entry '{entry_name}' you modified is MISSING in New Vanilla structure of '{mod_rel_path}'. Cannot merge block.", "WARN ", 2)
-                    summary["warn_entry_missing_nv_for_mod_block"] += 1; continue
-
-                current_nv_block_lines_in_output = output_lines[out_nv_entry_s : out_nv_entry_e+1]
-
-                if mod_block_lines_for_entry == current_nv_block_lines_in_output: # Content comparison
-                    log_message(f"Entry '{entry_name}': Your modded block is identical to this New Vanilla block in current output. No change.", "INFO", 2)
-                    continue
-
-                log_message(f"Entry '{entry_name}': Your mod's block differs from New Vanilla's.", "INFO", 2)
-                
-                # --- SPECIAL HANDLING for innovation_longboats -> character_modifier -> diplomatic_range_mult ---
-                handled_by_special_logic = False
-                if entry_name == 'innovation_longboats':
-                    log_message(f"Checking for specific 'diplomatic_range_mult' tweak within '{entry_name}'.", "DETAIL", 3)
-                    target_sub_block_key = 'character_modifier'
-                    param_to_add_key = 'diplomatic_range_mult'
-                    
-                    # 1. Check if your mod's innovation_longboats has char_mod with diplo_range
-                    mod_il_cm_s, mod_il_cm_e = find_entry_block_indices(target_sub_block_key, mod_block_lines_for_entry)
-                    your_diplo_val_from_mod = None
-                    if mod_il_cm_s is not None:
-                        mod_cm_params = get_parameters_within_block(mod_block_lines_for_entry, mod_il_cm_s, mod_il_cm_e)
-                        if param_to_add_key in mod_cm_params:
-                            your_diplo_val_from_mod = mod_cm_params[param_to_add_key][0]
-
-                    if your_diplo_val_from_mod is not None: # Your mod wants to set/add this param
-                        # 2. Find character_modifier in current output_lines (within the innovation_longboats block)
-                        # We search from the start of the innovation_longboats block in output_lines
-                        cm_out_s, cm_out_e = find_entry_block_indices(target_sub_block_key, output_lines, out_nv_entry_s) 
-                        
-                        if cm_out_s is not None and cm_out_s > out_nv_entry_s and cm_out_e < out_nv_entry_e : # Ensure sub-block is within parent
-                            out_cm_params = get_parameters_within_block(output_lines, cm_out_s, cm_out_e)
-                            current_diplo_val_in_nv_subblock = out_cm_params.get(param_to_add_key, (None,None))[0]
-
-                            log_message(f"  Sub-block '{target_sub_block_key}', Param '{param_to_add_key}':", "INFO", 4)
-                            log_message(f"    Your Mod wants : '{your_diplo_val_from_mod}'", "INFO", 5)
-                            log_message(f"    New Vanilla has: '{current_diplo_val_in_nv_subblock if current_diplo_val_in_nv_subblock is not None else "__ABSENT__"}'", "INFO", 5)
-
-                            if current_diplo_val_in_nv_subblock is None: # Absent in NV sub-block, your mod adds it
-                                prompt_add_specific = f"Add '{param_to_add_key} = {your_diplo_val_from_mod}' to '{target_sub_block_key}' inside '{entry_name}'?"
-                                if get_user_confirmation(prompt_add_specific, prompt_level="param_add_specific") == "yes":
-                                    indent = "      " # Default
-                                    if cm_out_e > cm_out_s + 1: # If char_mod block not empty
-                                        m = re.match(r"(\s*)", output_lines[cm_out_s+1]); 
-                                        if m: indent = m.group(1)
-                                    new_line = f"{indent}{param_to_add_key} = {your_diplo_val_from_mod} # MODDED: Added by Mod (OV likely N/A here, NV=Absent)\n"
-                                    output_lines.insert(cm_out_e, new_line) # Insert before closing '}' of character_modifier
-                                    file_was_modified_by_script = True; summary["targeted_param_added"] +=1
-                                    handled_by_special_logic = True
-                                    log_message(f"Added '{param_to_add_key}' to '{target_sub_block_key}'.", "SUCCESS", 5)
-                                else: summary["targeted_param_add_skipped"] +=1
-                            elif your_diplo_val_from_mod != current_diplo_val_in_nv_subblock: # Exists in NV but different
-                                prompt_mod_specific = f"Change '{param_to_add_key}' in '{target_sub_block_key}' from NV '{current_diplo_val_in_nv_subblock}' to YourMod '{your_diplo_val_from_mod}'?"
-                                if get_user_confirmation(prompt_mod_specific, prompt_level="param_add_specific") == "yes": # Reusing param_add_specific options
-                                    # Find the line and modify it
-                                    for l_idx in range(cm_out_s + 1, cm_out_e):
-                                        p_k, _, _, p_c = parse_parameter_line(output_lines[l_idx])
-                                        if p_k == param_to_add_key:
-                                            leading_ws = re.match(r"(\s*)", output_lines[l_idx]).group(1)
-                                            cmt = f" # MODDED: OV=N/A, NV='{current_diplo_val_in_nv_subblock}', Applied='{your_diplo_val_from_mod}'"
-                                            output_lines[l_idx] = f"{leading_ws}{p_key} = {your_diplo_val_from_mod}{(' '+p_c) if p_c else ''}{cmt}\n"
-                                            file_was_modified_by_script = True; summary["targeted_param_modified"] +=1 # New summary key
-                                            handled_by_special_logic = True
-                                            log_message(f"Modified '{param_to_add_key}' in '{target_sub_block_key}'.", "SUCCESS", 5)
-                                            break
-                                else: summary["targeted_param_modification_skipped"] +=1 # New summary key
-                            else: # Values match
-                                log_message(f"'{param_to_add_key}' in '{target_sub_block_key}' already matches your mod. No change.", "SUCCESS", 5)
-                                handled_by_special_logic = True # No change, but special case was checked.
-                        else: # Your mod doesn't have the specific param, so no special action
-                            log_message(f"Your mod's '{entry_name}' doesn't have '{param_to_add_key}' in '{target_sub_block_key}'. Skipping special add.", "DEBUG", 4)
-                    else: # Character_modifier not found in New Vanilla's innovation_longboats
-                        log_message(f"Sub-block '{target_sub_block_key}' not found in New Vanilla '{entry_name}'. Cannot apply specific tweak.", "WARN ", 4)
-                        summary["warn_sub_block_missing_nv"] +=1
-
-
-                if not handled_by_special_logic: # General block replacement prompt
-                    log_message("  --- YOUR MODDED BLOCK (first 5 lines) ---", "DETAIL", 3)
-                    for l_idx,l_content in enumerate(mod_block_lines_for_entry[:5]): print(f"      {l_content.rstrip()}")
-                    if len(mod_block_lines_for_entry) > 5: print("      ...")
-                    log_message("  --- NEW VANILLA BLOCK (first 5 lines) ---", "DETAIL", 3)
-                    for l_idx,l_content in enumerate(current_nv_block_lines_in_output[:5]): print(f"      {l_content.rstrip()}")
-                    if len(current_nv_block_lines_in_output) > 5: print("      ...")
-                    
-                    prompt_block = f"Entry '{entry_name}': Replace New Vanilla block with YOUR mod's version?"
-                    if get_user_confirmation(prompt_block, prompt_level="block_replace") == "yes":
-                        # Replace the block in output_lines
-                        # Important: out_nv_entry_s, out_nv_entry_e were for original new_vanilla_lines_base.
-                        # If output_lines was modified by a previous entry addition, these indices are stale.
-                        # We must re-find the block in the current `output_lines` state.
-                        current_out_nv_entry_s, current_out_nv_entry_e = find_entry_block_indices(entry_name, output_lines)
-                        if current_out_nv_entry_s is not None:
-                            del output_lines[current_out_nv_entry_s : current_out_nv_entry_e+1]
-                            comment_prefix = [f"# --- MODDED: Block '{entry_name}' REPLACED by mod version ---\n"]
-                            formatted_mod_block_lines = [l if l.endswith('\n') else l + '\n' for l in mod_block_lines_for_entry]
-                            output_lines[current_out_nv_entry_s:current_out_nv_entry_s] = comment_prefix + formatted_mod_block_lines
-                            file_was_modified_by_script = True; summary["blocks_replaced_by_mod"] +=1
-                            log_message(f"Replaced block '{entry_name}'.", "SUCCESS", 3)
-                        else: log_message(f"ERROR: Could not find '{entry_name}' in current output_lines to replace.", "ERROR", 3)
+        elif change.type == 'VANILLA_DELETED':
+            log_message(f"Vanilla deleted '{change.old_node.key}'. Automatically removing it from output.", "INFO", 3)
+            # It should already be gone if output started as new_nodes.
+            # But if there's a reference in the output tree from a previous merge, ensure it's removed.
+            # Only remove if it *still exists* in the modified_output_nodes (e.g., if mod also had it and was kept)
+            if find_node_by_path(modified_output_nodes, change.key_path, differ_instance) is not None:
+                if isinstance(parent_for_manipulation, list):
+                    parent_for_manipulation[:] = [
+                        n for n in parent_for_manipulation 
+                        if differ_instance._get_node_identifier(n) != child_identifier_in_parent
+                    ]
+                else:
+                    parent_for_manipulation.remove_child(child_identifier_in_parent)
+                log_message(f"Confirmed removal of vanilla-deleted '{change.old_node.key}'.", "SUCCESS", 4)
+                file_was_modified_by_script = True
+            else:
+                log_message(f"Node '{change.key_path[-1]}' already absent in output. No action needed.", "INFO", 4)
+        
+        # Converged changes (MOD_ADDED_CONVERGED, MOD_DELETED_VANILLA_ALSO_DELETED, CONVERGED_MODIFICATION)
+        # These typically require no user action as both sides ended up with the same state.
+        elif change.type in ['MOD_ADDED_CONVERGED', 'MOD_DELETED_VANILLA_ALSO_DELETED', 'CONVERGED_MODIFICATION']:
+            log_message(f"Converged change on '{change.key_path[-1]}'. Automatically applied (both sides agree).", "INFO", 3)
+            # For deletions, we must ensure it's removed from the output tree if it happens to be there
+            if change.type == 'MOD_DELETED_VANILLA_ALSO_DELETED':
+                if find_node_by_path(modified_output_nodes, change.key_path, differ_instance) is not None:
+                    if isinstance(parent_for_manipulation, list):
+                        parent_for_manipulation[:] = [
+                            n for n in parent_for_manipulation 
+                            if differ_instance._get_node_identifier(n) != child_identifier_in_parent
+                        ]
                     else:
-                        summary["blocks_skipped_user"] +=1
-                        log_message(f"Kept New Vanilla block for '{entry_name}'.", "INFO", 3)
-        
-        if file_was_modified_by_script:
-            if write_file_lines(output_abs_path, output_lines):
-                summary["files_written"] += 1
-                log_message(f"Written '{output_abs_path}' to output.", "SUCCESS", 1)
+                        parent_for_manipulation.remove_child(child_identifier_in_parent)
+                    log_message(f"Confirmed converged deletion of '{change.key_path[-1]}'.", "SUCCESS", 4)
+                    file_was_modified_by_script = True
         else:
-            log_message(f"No confirmed changes written to output for '{mod_rel_path}'.", "INFO", 1)
+            log_message(f"Unhandled change type (no action taken): {change.type} for '{change.key_path[-1]}'. Manual review needed.", "WARN", 3)
 
-    log_message(f"Phase 2 Summary.", "PHASE"); return summary
+    # Write the modified output tree to the file
+    if file_was_modified_by_script:
+        os.makedirs(os.path.dirname(output_abs_path), exist_ok=True)
+        final_output_content = PdsParser._nodes_to_string(modified_output_nodes)
+        with open(output_abs_path, 'w', encoding='utf-8-sig') as f:
+            f.write(final_output_content)
+        log_message(f"Successfully merged changes and wrote '{mod_rel_path}' to output.", "SUCCESS", 1)
+        return True # Indicate successful merge
+    else:
+        log_message(f"No changes applied to '{mod_rel_path}' by script based on detected diffs. Copying original New Vanilla.", "INFO", 1)
+        os.makedirs(os.path.dirname(output_abs_path), exist_ok=True)
+        shutil.copy2(new_vanilla_abs_path, output_abs_path)
+        return False # Indicate no significant change was applied by the merge process
+
 
 # --- Main Script Execution ---
 def main():
-    script_version = "v12.2 - Restored Core Parsers & Targeted Nested Fix"
+    script_version = "v13.1 - Enhanced File Filtering, Error Handling"
     log_message(f"Script started. CK3 Mod Updater ({script_version}).", "HEAD")
     global AUTO_PROCESS_ALL_FILES_SESSION, AUTO_APPLY_ALL_CHANGES_THIS_FILE, AUTO_APPLY_ALL_CHANGES_SESSION
     AUTO_PROCESS_ALL_FILES_SESSION, AUTO_APPLY_ALL_CHANGES_THIS_FILE, AUTO_APPLY_ALL_CHANGES_SESSION = False, False, False
@@ -475,9 +493,10 @@ def main():
     if not paths_ok: return
 
     log_message(f"Output: '{MOD_OUTPUT_DIR}'", "INFO")
-    log_message("Output dir will be DELETED/RECREATED.", "WARN ")
+    log_message("Output dir will be DELETED/RECREATED.", "WARN")
     if get_user_confirmation(f"Proceed? (Deletes '{OUTPUT_SUBFOLDER_NAME}')", prompt_level="initial_script_start") == "no":
         log_message("Cancelled.", "INFO"); return
+    
     if os.path.exists(MOD_OUTPUT_DIR):
         log_message(f"Removing '{MOD_OUTPUT_DIR}'...", "DETAIL")
         try: shutil.rmtree(MOD_OUTPUT_DIR)
@@ -486,22 +505,106 @@ def main():
     except Exception as e: log_message(f"Could not create output dir: {e}. Exiting.", "FATAL"); return
     log_message(f"Output dir ready: '{MOD_OUTPUT_DIR}'", "SUCCESS")
 
-    potential_actions = identify_block_level_actions()
-    
-    if not potential_actions:
-        log_message("No potential actions from your mod. Output mod empty.", "INFO")
-    else:
-        final_summary = apply_block_changes_and_targeted_adds(potential_actions)
-        log_message("\n" + ("-" * 30) + f" Final Summary ({script_version}) " + ("-" * 30), "HEAD")
-        for key, value in final_summary.items():
-            log_message(f"  {key.replace('_', ' ').capitalize()}: {value}", "RSLT_DTL")
-        log_message("-" * (78), "HEAD")
+    processed_files_count = 0
+    skipped_files_count = 0
+    total_files_with_mod_changes = 0 # Files where mod had *some* change (added, modified, deleted)
 
+    # Instantiate PdsDiffer once
+    differ = PdsDiffer()
+
+    # Walk through mod source directory AND new vanilla directory to find relevant files
+    for folder_name in FOLDERS_TO_PROCESS:
+        mod_folder_path = os.path.join(MOD_SOURCE_DIR, folder_name)
+        new_vanilla_folder_path = os.path.join(GAME_VANILLA_DIR_NEW, folder_name)
+        old_vanilla_folder_path = os.path.join(OLD_VANILLA_DIR_REFERENCE, folder_name)
+
+        if not os.path.isdir(mod_folder_path) and not os.path.isdir(new_vanilla_folder_path):
+            log_message(f"Skipping folder '{folder_name}': neither mod nor new vanilla path exists.", "WARN", 1)
+            continue
+        
+        all_relevant_files_in_folder = set()
+
+        # Add all .txt files from New Vanilla
+        if os.path.isdir(new_vanilla_folder_path):
+            for root, _, files in os.walk(new_vanilla_folder_path):
+                for filename in files:
+                    if filename.lower().endswith(".txt"):
+                        rel_path = os.path.relpath(os.path.join(root, filename), GAME_VANILLA_DIR_NEW)
+                        all_relevant_files_in_folder.add(rel_path)
+
+        # Add all .txt files from Mod Source
+        if os.path.isdir(mod_folder_path):
+            for root, _, files in os.walk(mod_folder_path):
+                for filename in files:
+                    if filename.lower().endswith(".txt"):
+                        rel_path = os.path.relpath(os.path.join(root, filename), MOD_SOURCE_DIR)
+                        all_relevant_files_in_folder.add(rel_path)
+        
+        for mod_rel_path in sorted(list(all_relevant_files_in_folder)):
+            mod_abs_path = os.path.join(MOD_SOURCE_DIR, mod_rel_path)
+            old_vanilla_abs_path = os.path.join(OLD_VANILLA_DIR_REFERENCE, mod_rel_path)
+            new_vanilla_abs_path = os.path.join(GAME_VANILLA_DIR_NEW, mod_rel_path)
+            output_abs_path = os.path.join(MOD_OUTPUT_DIR, mod_rel_path)
+
+            # --- Primary File Filtering Logic ---
+            # Scenario 1: File is NEW IN YOUR MOD (exists in Mod, not in New Vanilla)
+            if os.path.exists(mod_abs_path) and not os.path.exists(new_vanilla_abs_path):
+                log_message(f"File '{mod_rel_path}' is NEW IN YOUR MOD (not in New Vanilla).", "INFO")
+                prompt = f"Mod file '{mod_rel_path}' is new. Copy to updated mod as is?"
+                if get_user_confirmation(prompt, prompt_level="file_process_summary") == "yes":
+                    os.makedirs(os.path.dirname(output_abs_path), exist_ok=True)
+                    shutil.copy2(mod_abs_path, output_abs_path)
+                    log_message(f"Copied new mod file '{mod_rel_path}'.", "SUCCESS", 1)
+                    processed_files_count += 1
+                else:
+                    log_message(f"Skipped new mod file '{mod_rel_path}'.", "INFO", 1)
+                    skipped_files_count += 1
+                total_files_with_mod_changes += 1
+                continue # Done with this file, move to next
+
+            # Scenario 2: File exists in New Vanilla. Check if YOUR MOD changed it.
+            elif os.path.exists(new_vanilla_abs_path):
+                # Is there a corresponding Old Vanilla file?
+                mod_file_exists_in_old_vanilla = os.path.exists(old_vanilla_abs_path)
+                
+                # Check if your mod file (M) is identical to Old Vanilla (O).
+                # If so, your mod made no changes to this file, so just copy New Vanilla.
+                if mod_file_exists_in_old_vanilla and filecmp.cmp(mod_abs_path, old_vanilla_abs_path, shallow=False):
+                    log_message(f"File '{mod_rel_path}' has NO MOD CHANGES (identical to Old Vanilla). Copying New Vanilla.", "INFO")
+                    os.makedirs(os.path.dirname(output_abs_path), exist_ok=True)
+                    shutil.copy2(new_vanilla_abs_path, output_abs_path)
+                    processed_files_count += 1
+                    # total_files_with_mod_changes does NOT increment here as mod had no changes
+                    continue # Done with this file, move to next
+
+                # Scenario 3: Modded file is different from Old Vanilla (or Old Vanilla is missing, implying Mod's original file was new/changed)
+                # This is where we need the 3-way diff merge.
+                log_message(f"File '{mod_rel_path}' has MOD CHANGES (differs from Old Vanilla). Initiating 3-way merge.", "INFO")
+                if process_single_file_merge(mod_rel_path, differ): # Pass the differ instance
+                    processed_files_count += 1
+                else:
+                    skipped_files_count += 1
+                total_files_with_mod_changes += 1
+            
+            # Scenario 4: File only in Old Vanilla (not in Mod Source, not in New Vanilla) - a vanilla deletion not impacted by your mod.
+            # This file is typically not part of the mod update process.
+            elif os.path.exists(old_vanilla_abs_path):
+                log_message(f"File '{mod_rel_path}' exists only in Old Vanilla (or original mod), not in New Vanilla or current Mod. Skipping.", "DEBUG", 1)
+                # No action needed, it was likely deleted by Paradox and you didn't have it either or removed it.
+            else:
+                log_message(f"File '{mod_rel_path}' not found in any relevant directories. Skipping.", "DEBUG", 1)
+
+
+    log_message("\n" + ("-" * 30) + f" Final Summary ({script_version}) " + ("-" * 30), "HEAD")
+    log_message(f"Total files processed: {processed_files_count}", "RSLT_DTL")
+    log_message(f"Total files skipped/unmodified by script: {skipped_files_count}", "RSLT_DTL")
+    log_message(f"Total files with mod-initiated changes (processed for merge): {total_files_with_mod_changes}", "RSLT_DTL")
+    log_message("-" * (78), "HEAD")
     log_message(f"Script finished. Check the '{MOD_OUTPUT_DIR}' directory.", "HEAD")
     log_message("CRITICAL: Manually review ALL generated files. Use a diff tool!", "WARN ")
 
 if __name__ == "__main__":
-    script_version_print = "v12.2 - Restored Core Parsers, Block Logic, Targeted Nested Fix"
+    script_version_print = "v13.1 - Enhanced File Filtering, Error Handling"
     print(f"--- Crusader Kings III Mod Updater Script ({script_version_print}) ---")
     print(f"MOD SOURCE:          '{MOD_SOURCE_DIR}'")
     print(f"OLD VANILLA REF:     '{OLD_VANILLA_DIR_REFERENCE}'")
