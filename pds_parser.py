@@ -2,7 +2,7 @@ import re
 import os
 import difflib
 
-# --- PdsLexer and PdsToken (Integrated from your script) ---
+# --- PdsLexer and PdsToken ---
 
 class PdsToken:
     """Represents a token found during lexical analysis."""
@@ -102,7 +102,7 @@ class PdsLexer:
         self.tokens.append(PdsToken('EOF', '', self.line, self.column)) 
         return self.tokens
 
-# --- PdsNode Classes (Adapted for token-based parsing) ---
+# --- PdsNode Classes ---
 
 class PdsNode:
     def __init__(self, line_number=-1): 
@@ -114,31 +114,30 @@ class PdsNode:
 
     def __repr__(self):
         key_repr = getattr(self, 'key', 'N/A')
-        # Ensure key_repr is a string for formatting, especially if it's numeric
-        if not isinstance(key_repr, str):
-            key_repr = str(key_repr)
-
+        if not isinstance(key_repr, str): key_repr = str(key_repr)
         comment_repr = getattr(self, 'comment_text_on_line', None)
         comment_str = f", CommentText='{comment_repr[:20]}...'" if comment_repr else ""
         
-        if isinstance(self, PdsComment):
-            key_repr = f"Comment: '{getattr(self, 'comment_text', '')[:30]}...'"
-        elif isinstance(self, PdsBlankLine):
-            key_repr = "Blank Line"
-        elif isinstance(self, PdsList):
-            key_repr = f"{key_repr}={{...}}"
-        elif isinstance(self, PdsOperatorCondition):
-            key_repr = f"{key_repr} {self.operator} {self.value}"
-        elif isinstance(self, PdsBlock): 
-            key_repr = f"{key_repr}={{...}}"
-        elif isinstance(self, PdsKeyValuePair) and isinstance(self.value, PdsBlock):
-            key_repr = f"{key_repr}={{...}}" # Display KVP with block value like a block
+        display_class_name = self.__class__.__name__
+        specific_repr = ""
+        if isinstance(self, PdsComment): specific_repr = f"Comment: '{getattr(self, 'comment_text', '')[:30]}...'"
+        elif isinstance(self, PdsBlankLine): specific_repr = "Blank Line"
+        elif isinstance(self, PdsList): specific_repr = f"{key_repr}={{...}}"
+        elif isinstance(self, PdsOperatorCondition): specific_repr = f"{key_repr} {self.operator} {self.value}"
+        elif isinstance(self, PdsBlock): specific_repr = f"{key_repr}={{...}}"
+        elif isinstance(self, PdsKeyValuePair) and isinstance(self.value, PdsBlock): specific_repr = f"{key_repr}={{...}}"
+        else: specific_repr = f"K='{key_repr}'"
         
-        return f"<{self.__class__.__name__} L{self.line_number} I{self.indent_level} K='{key_repr}'{comment_str}>"
+        return f"<{display_class_name} L{self.line_number} I{self.indent_level} {specific_repr}{comment_str}>"
 
+    def copy(self): # Basic copy, subclasses should override for deep copy if they have complex mutable members
+        new_node = self.__class__(line_number=self.line_number)
+        new_node.indent_level = self.indent_level
+        # Copy other common simple attributes if any
+        if hasattr(self, 'comment_text_on_line'):
+            new_node.comment_text_on_line = self.comment_text_on_line
+        return new_node
 
-    def copy(self):
-        return self.__class__(line_number=self.line_number)
 
 class PdsComment(PdsNode):
     def __init__(self, comment_text, line_number=-1):
@@ -150,8 +149,8 @@ class PdsComment(PdsNode):
         return f"{indent_str}# {self.comment_text}\n"
 
     def copy(self):
-        new_node = self.__class__(comment_text=self.comment_text, line_number=self.line_number)
-        new_node.indent_level = self.indent_level
+        new_node = super().copy()
+        new_node.comment_text = self.comment_text
         return new_node
 
 class PdsBlankLine(PdsNode):
@@ -162,14 +161,10 @@ class PdsBlankLine(PdsNode):
         return "\n"
 
     def copy(self):
-        new_node = self.__class__(line_number=self.line_number)
-        new_node.indent_level = self.indent_level
-        return new_node
+        return super().copy()
 
 
 class PdsKeyValuePair(PdsNode):
-    # Class attribute for lexer's identifier pattern, used in to_string for quoting decisions
-    # This is a bit of a hack; ideally, PdsNode wouldn't need lexer specifics.
     _lexer_identifier_pattern = r'[\w\.:@\-]+' 
 
     def __init__(self, key, value, line_number=-1, comment_text=None):
@@ -183,68 +178,48 @@ class PdsKeyValuePair(PdsNode):
         value_output_str = ""
 
         if isinstance(self.value, PdsBlock):
-             # Anonymous block value: its to_string will handle braces and content.
-             # It starts on a new line, aligned with the KVP's indent for the opening brace.
              value_output_str = "\n" + self.value.to_string(current_indent)
         elif isinstance(self.value, str):
-            # Heuristic for re-quoting string values:
-            # If it contains characters that would require quoting in PDS,
-            # or if it's empty, quote it. Otherwise, print as is.
-            # This might change `key = "val"` to `key = val` if `val` is a valid identifier.
             must_quote = (
                 ' ' in self.value or '\t' in self.value or
                 '#' in self.value or '=' in self.value or
                 '{' in self.value or '}' in self.value or
-                '"' in self.value or not self.value # Empty string must be quoted ""
+                '"' in self.value or not self.value 
             )
-            # Additionally, if it's not a simple identifier, it might need quoting.
-            # PDS unquoted identifiers typically don't start/end with '.' or contain '..'
-            # and match a general pattern.
             is_simple_identifier = re.fullmatch(PdsKeyValuePair._lexer_identifier_pattern, self.value)
             
-            if must_quote or not is_simple_identifier:
-                 # Check if it's a number-like string that should not be quoted (e.g. "1.0", "-5")
-                 # This case is tricky because the lexer already distinguishes NUMBER from STRING.
-                 # If self.value is a string "123", it came from a STRING token, so quote it.
+            if must_quote or (self.value and not is_simple_identifier): # Ensure non-empty non-identifiers are quoted
                  value_output_str = f'"{self.value}"'
             else:
                 value_output_str = self.value
-        else: # Python numbers (int, float), or other types (should be rare)
+        else: 
             value_output_str = str(self.value)
         
-        # Construct the line
         line_content = f"{indent_str}{self.key} = {value_output_str}"
         if self.comment_text_on_line:
             line_content += f" # {self.comment_text_on_line}"
         
-        # If the value was a block, it already includes newlines.
-        # Otherwise, add a newline at the end of the KVP.
         if isinstance(self.value, PdsBlock):
-            return line_content # Block's to_string provides its own final newline
+            return line_content 
         else:
             return line_content + "\n"
 
     def copy(self):
-        new_node = self.__class__(
-            key=self.key,
-            value=self.value.copy() if isinstance(self.value, PdsNode) else self.value, 
-            line_number=self.line_number,
-            comment_text=self.comment_text_on_line
-        )
-        new_node.indent_level = self.indent_level
+        new_node = super().copy()
+        new_node.key = self.key
+        new_node.value = self.value.copy() if isinstance(self.value, PdsNode) else self.value
+        # comment_text_on_line is handled by super().copy() if it's a common attribute
         return new_node
-
 
 class PdsList(PdsNode): 
     def __init__(self, key, values, line_number=-1, comment_text=None): 
         super().__init__(line_number=line_number)
         self.key = key
-        self.values = values # values are expected to be simple Python strings/numbers
+        self.values = values 
         self.comment_text_on_line = comment_text
 
     def to_string(self, current_indent=0):
         indent_str = " " * current_indent
-        # For values in a list, if they are strings that would need quoting, quote them.
         formatted_values = []
         for v in self.values:
             if isinstance(v, str):
@@ -264,13 +239,9 @@ class PdsList(PdsNode):
         return f"{base_string}\n"
 
     def copy(self):
-        new_node = self.__class__(
-            key=self.key,
-            values=list(self.values), 
-            line_number=self.line_number,
-            comment_text=self.comment_text_on_line
-        )
-        new_node.indent_level = self.indent_level
+        new_node = super().copy()
+        new_node.key = self.key
+        new_node.values = list(self.values)
         return new_node
 
 class PdsOperatorCondition(PdsNode):
@@ -286,10 +257,8 @@ class PdsOperatorCondition(PdsNode):
         value_output_str = ""
 
         if isinstance(self.value, PdsBlock):
-            # Block as value for an operator, e.g., NOT = { ... }
             value_output_str = "\n" + self.value.to_string(current_indent)
         elif isinstance(self.value, str):
-            # Apply similar quoting logic as PdsKeyValuePair
             must_quote = (
                 ' ' in self.value or '\t' in self.value or
                 '#' in self.value or '=' in self.value or
@@ -297,7 +266,7 @@ class PdsOperatorCondition(PdsNode):
                 '"' in self.value or not self.value
             )
             is_simple_identifier = re.fullmatch(PdsKeyValuePair._lexer_identifier_pattern, self.value)
-            if must_quote or not is_simple_identifier:
+            if must_quote or (self.value and not is_simple_identifier):
                  value_output_str = f'"{self.value}"'
             else:
                 value_output_str = self.value
@@ -314,14 +283,10 @@ class PdsOperatorCondition(PdsNode):
             return line_content + "\n"
 
     def copy(self):
-        new_node = self.__class__(
-            key=self.key,
-            operator=self.operator,
-            value=self.value.copy() if isinstance(self.value, PdsNode) else self.value, 
-            line_number=self.line_number,
-            comment_text=self.comment_text_on_line
-        )
-        new_node.indent_level = self.indent_level
+        new_node = super().copy()
+        new_node.key = self.key
+        new_node.operator = self.operator
+        new_node.value = self.value.copy() if isinstance(self.value, PdsNode) else self.value
         return new_node
 
 class PdsBlock(PdsNode):
@@ -356,38 +321,26 @@ class PdsBlock(PdsNode):
         output_lines.append(f"{indent_str}}}\n") 
         return "".join(output_lines)
     
-    # find_node, copy, replace_child, remove_child, add_child_at_appropriate_location remain the same as your last version
     def find_node(self, key_path):
         if isinstance(key_path, str): key_path = key_path.split('.')
         if not key_path: return None
-        
         current_nodes_to_search = self.children
         for i, segment in enumerate(key_path):
             found_node_for_segment = None
             for node in current_nodes_to_search:
-                # Ensure node.key is string for comparison
                 node_key_str = str(node.key) if hasattr(node, 'key') else None
                 if node_key_str == segment: 
                     if i == len(key_path) - 1: return node 
                     elif isinstance(node, PdsBlock): 
-                        found_node_for_segment = node
-                        break 
-                    else: 
-                        return None 
-            
-            if found_node_for_segment: 
-                current_nodes_to_search = found_node_for_segment.children
-            else: 
-                return None 
+                        found_node_for_segment = node; break 
+                    else: return None 
+            if found_node_for_segment: current_nodes_to_search = found_node_for_segment.children
+            else: return None 
         return None 
 
     def copy(self):
-        new_node = self.__class__(
-            key=self.key,
-            line_number=self.line_number,
-            comment_text=self.comment_text_on_line
-        )
-        new_node.indent_level = self.indent_level
+        new_node = super().copy()
+        new_node.key = self.key
         new_node.children = [child.copy() for child in self.children] 
         return new_node
 
@@ -395,16 +348,12 @@ class PdsBlock(PdsNode):
         for i, child in enumerate(self.children):
             child_key_str = str(child.key) if hasattr(child, 'key') else None
             if child_key_str == str(old_child_identifier): 
-                self.children[i] = new_child_node
-                return True
+                self.children[i] = new_child_node; return True
         return False
 
     def remove_child(self, child_identifier):
         original_len = len(self.children)
-        self.children = [
-            child for child in self.children 
-            if not (hasattr(child, 'key') and str(child.key) == str(child_identifier))
-        ]
+        self.children = [c for c in self.children if not (hasattr(c, 'key') and str(c.key) == str(child_identifier))]
         return len(self.children) < original_len
 
     def add_child_at_appropriate_location(self, new_child_node, target_sibling_identifier=None, after=True):
@@ -412,22 +361,16 @@ class PdsBlock(PdsNode):
             for i, child in enumerate(self.children):
                 child_key_str = str(child.key) if hasattr(child, 'key') else None
                 if child_key_str == str(target_sibling_identifier): 
-                    insert_idx = i + 1 if after else i
-                    self.children.insert(insert_idx, new_child_node)
-                    return True
-        
+                    self.children.insert(i + 1 if after else i, new_child_node); return True
         last_code_node_idx = -1
         for i in reversed(range(len(self.children))):
             if not isinstance(self.children[i], (PdsComment, PdsBlankLine)):
-                last_code_node_idx = i
-                break
-        
-        if last_code_node_idx != -1:
-            self.children.insert(last_code_node_idx + 1, new_child_node)
-        else: 
-            self.children.append(new_child_node)
+                last_code_node_idx = i; break
+        if last_code_node_idx != -1: self.children.insert(last_code_node_idx + 1, new_child_node)
+        else: self.children.append(new_child_node)
         return True
 
+# --- PdsParser ---
 class PdsParser:
     def __init__(self):
         self.tokens = []
@@ -470,7 +413,9 @@ class PdsParser:
         return PdsComment(token.value, token.line)
 
     def _parse_blank_line(self):
-        first_token = self._peek()
+        # Assumes the calling context decided this is a "true" blank line.
+        # Consumes all consecutive NEWLINE tokens from the current position.
+        first_token = self._peek() # Should be NEWLINE
         line_number = first_token.line
         while self._peek().type == 'NEWLINE':
             self._advance()
@@ -483,87 +428,96 @@ class PdsParser:
             return self._parse_block("", lbrace_token.line) 
         elif token.type == 'IDENTIFIER':
             value_token = self._consume('IDENTIFIER')
-            return value_token.value # Store as is, quoting handled by to_string
+            return value_token.value 
         elif token.type == 'NUMBER':
             value_token = self._consume('NUMBER')
-            # Try to convert to int or float
             try:
                 if '.' in value_token.value: return float(value_token.value)
                 else: return int(value_token.value)
-            except ValueError: return value_token.value # Should not happen if lexer NUMBER is correct
+            except ValueError: return value_token.value 
         elif token.type == 'STRING':
             value_token = self._consume('STRING')
-            return value_token.value[1:-1] # Strip quotes
+            return value_token.value[1:-1] 
         self._error(f"Expected a value (IDENTIFIER, NUMBER, STRING, or LBRACE for a block)")
 
     def _parse_key_value_pair(self, key_string, key_line_number):
-        # '=' is already consumed by _parse_statement before calling this
         value = self._parse_value()
-        # Inline comment handling would go here if desired, by peeking for COMMENT
-        # For now, comments are generally parsed as separate statements.
         return PdsKeyValuePair(key_string, value, key_line_number)
 
     def _parse_operator_condition(self, key_string, operator_str, key_line_number):
-        # Operator token is already consumed by _parse_statement, operator_str is passed in.
         value = self._parse_value() 
         return PdsOperatorCondition(key_string, operator_str, value, key_line_number)
 
     def _parse_list(self, key_part_string, key_line_number): 
-        # key, '=', and '{' are already consumed by _parse_statement
         values = []
         while self._peek().type != 'RBRACE' and not self.is_eof():
             token = self._peek()
             if token.type in ['IDENTIFIER', 'NUMBER', 'STRING']:
-                # _parse_value will consume the token and handle type conversion/string de-quoting
                 values.append(self._parse_value()) 
             elif token.type == 'NEWLINE' or token.type == 'COMMENT': 
                 self._advance() 
             else:
-                self._error(f"Unexpected token {token.type} inside PdsList values. Lists expect simple values, NEWLINEs, or COMMENTs.")
-        
+                self._error(f"Unexpected token {token.type} inside PdsList values.")
         self._consume('RBRACE') 
         return PdsList(key_part_string, values, key_line_number) 
 
     def _parse_block(self, key_part_string, key_line_number): 
-        # Key (if any) and '{' are already consumed
         block_node = PdsBlock(key_part_string, key_line_number) 
         self.stack.append(block_node)
-
         while self._peek().type != 'RBRACE' and not self.is_eof():
             child_node = self._parse_statement() 
             if child_node:
                 block_node.add_child(child_node)
-            else: # Should ideally not happen if _parse_statement errors or advances
-                if self._peek().type != 'RBRACE' and not self.is_eof():
-                     self._error(f"Could not parse statement inside block '{key_part_string}'")
-        
+            # If _parse_statement returns None (e.g. for skipped separator newlines), we just loop.
+            elif self.is_eof() or self._peek().type == 'RBRACE': # Break if loop should end
+                break
+            else: # Should not happen if _parse_statement advances or errors
+                 self._error(f"Could not parse statement inside block '{key_part_string}' and not at end of block.")
         self._consume('RBRACE') 
-        
-        if self.stack and self.stack[-1] is block_node:
-            self.stack.pop()
-        else:
-            self._error(f"Mismatched closing brace for block '{key_part_string}': Parser stack inconsistency.")
-        
+        if self.stack and self.stack[-1] is block_node: self.stack.pop()
+        else: self._error(f"Mismatched closing brace for block '{key_part_string}'.")
         return block_node
 
     def _parse_statement(self):
-        token = self._peek()
-        statement_start_line = token.line 
+        # Skip leading single newlines that are just separators and don't form a PdsBlankLine node.
+        # A PdsBlankLine node is created by _parse_blank_line() only if it sees multiple newlines
+        # or a single newline that is truly acting as a separator (e.g., before RBRACE/EOF).
+        while self._peek().type == 'NEWLINE':
+            # If this NEWLINE is followed by something other than another NEWLINE,
+            # and that something is not RBRACE or EOF (where a preceding blank line might be intended),
+            # then it's likely a formatting newline, not a blank line node itself.
+            next_token_after_newline = self._peek(1)
+            if next_token_after_newline.type not in ['NEWLINE', 'RBRACE', 'EOF']:
+                self._advance() # Consume the separator newline and loop to check again
+            else:
+                # This newline is either part of a multi-newline sequence,
+                # or it's a single newline before RBRACE/EOF.
+                # In these cases, we let it be handled by the NEWLINE case below,
+                # which will call _parse_blank_line().
+                break 
         
+        # After skipping separator newlines, proceed with parsing the actual statement
+        token = self._peek()
+        # statement_start_line = token.line # Line number of the *actual* start of the statement
+
         if token.type == 'COMMENT':
             return self._parse_comment()
-        elif token.type == 'NEWLINE':
+        elif token.type == 'NEWLINE': 
+            # This is reached if the loop above breaks, meaning we have:
+            # 1. A sequence of NEWLINEs (e.g., NEWLINE, NEWLINE, ...)
+            # 2. A single NEWLINE followed by RBRACE
+            # 3. A single NEWLINE followed by EOF
+            # These are considered candidates for PdsBlankLine nodes.
             return self._parse_blank_line()
         
+        # --- Key parsing and statement determination for IDENTIFIER or NUMBER keys ---
         key_token = self._peek()
-        key_value_str = key_token.value # Will be stringified for numbers too
+        key_value_str = key_token.value 
         key_line_num = key_token.line
 
-        if key_token.type == 'IDENTIFIER' or key_token.type == 'NUMBER': # Allow NUMBER as key
-            self._consume(key_token.type) # Consume the first part of the key (ID or NUM)
+        if key_token.type == 'IDENTIFIER' or key_token.type == 'NUMBER':
+            self._consume(key_token.type) 
 
-            # Check for multi-part IDENTIFIER key (e.g., "scripted_effect effect_name")
-            # This only applies if the first part was an IDENTIFIER.
             if key_token.type == 'IDENTIFIER' and \
                self._peek().type == 'IDENTIFIER' and \
                self._peek(1).type in ['EQUALS', 'OPERATOR', 'LBRACE']:
@@ -573,25 +527,22 @@ class PdsParser:
             next_structural_token = self._peek()
 
             if next_structural_token.type == 'EQUALS':
-                self._consume('EQUALS') # Consume '='
-                if self._peek().type == 'LBRACE': # Key = { ... }
-                    self._consume('LBRACE') # Consume '{'
-                    
-                    # Heuristic for Block vs List
+                self._consume('EQUALS') 
+                if self._peek().type == 'LBRACE': 
+                    self._consume('LBRACE') 
                     is_block_heuristic = False 
                     scan_idx = self.current_token_index 
                     h_brace_balance = 1 
-                    
                     while scan_idx < len(self.tokens):
                         h_token = self.tokens[scan_idx]
                         if h_token.type == 'LBRACE': h_brace_balance += 1
                         elif h_token.type == 'RBRACE':
                             h_brace_balance -= 1
                             if h_brace_balance == 0: break 
-                        if h_brace_balance < 0: self._error("Malformed braces during block/list detection heuristic."); break
+                        if h_brace_balance < 0: self._error("Malformed braces during block/list detection."); break
                         
                         if h_brace_balance == 1: 
-                            if h_token.type in ['NEWLINE', 'COMMENT']: scan_idx += 1; continue
+                            if h_token.type in ['NEWLINE', 'COMMENT']: scan_idx += 1; continue 
                             if h_token.type == 'IDENTIFIER':
                                 if scan_idx + 1 < len(self.tokens) and \
                                    self.tokens[scan_idx+1].type in ['EQUALS', 'OPERATOR', 'LBRACE']:
@@ -600,30 +551,34 @@ class PdsParser:
                                  if scan_idx + 1 < len(self.tokens) and \
                                     self.tokens[scan_idx+1].type == 'EQUALS':
                                     is_block_heuristic = True; break
-                        if h_token.type == 'EOF': self._error("EOF reached during block/list detection heuristic."); break
+                        if h_token.type == 'EOF': self._error("EOF reached during block/list detection."); break
                         scan_idx += 1
                     
-                    block_display_key = f"{key_value_str} =" # For both list and block if they start with key =
+                    block_display_key = f"{key_value_str} =" 
                     if is_block_heuristic:
                         return self._parse_block(block_display_key, key_line_num)
                     else:
                         return self._parse_list(block_display_key, key_line_num)
-                else: # Key = Value
+                else: 
                     return self._parse_key_value_pair(key_value_str, key_line_num)
 
-            elif next_structural_token.type == 'OPERATOR': # Key OPERATOR ...
+            elif next_structural_token.type == 'OPERATOR': 
                 operator_actual_token = self._consume('OPERATOR') 
                 return self._parse_operator_condition(key_value_str, operator_actual_token.value, key_line_num)
 
-            elif next_structural_token.type == 'LBRACE': # Key { ... } (Block without '=')
+            elif next_structural_token.type == 'LBRACE': 
                 self._consume('LBRACE')
-                return self._parse_block(key_value_str, key_line_num) # Key is just the identifier/number
+                return self._parse_block(key_value_str, key_line_num) 
             
             else:
                 self._error(f"Unexpected token '{next_structural_token.type}' after key '{key_value_str}'. Expected '=', operator, or '{{'.")
         
+        elif token.type == 'EOF': # If, after skipping newlines, we hit EOF
+            return None # No more statements to parse
+            
         else: 
-            self._error(f"Statement must start with IDENTIFIER, NUMBER, COMMENT, or NEWLINE.")
+            self._error(f"Statement must start with IDENTIFIER, NUMBER, COMMENT, or be a blank line.")
+
 
     def parse_file(self, filepath):
         self.root_nodes = [] 
@@ -631,39 +586,40 @@ class PdsParser:
         self.current_token_index = 0
 
         if not os.path.exists(filepath):
-            print(f"Error: File not found: {filepath}"); 
-            return [] 
+            print(f"Error: File not found: {filepath}"); return [] 
         try:
             with open(filepath, 'r', encoding='utf-8-sig') as f: text_content = f.read()
         except UnicodeDecodeError:
             try: 
                 with open(filepath, 'r', encoding='utf-8') as f: text_content = f.read()
             except Exception as e_inner: 
-                print(f"Error reading file {filepath} with utf-8 fallback: {e_inner}"); 
-                return []
+                print(f"Error reading file {filepath} with utf-8 fallback: {e_inner}"); return []
         except Exception as e: 
-            print(f"Error reading file {filepath}: {e}"); 
-            return []
+            print(f"Error reading file {filepath}: {e}"); return []
         
         lexer = PdsLexer(text_content)
         try:
             self.tokens = lexer.tokenize()
         except ValueError as lex_err:
-            print(f"Lexer error in {filepath}: {lex_err}")
-            return []
+            print(f"Lexer error in {filepath}: {lex_err}"); return []
 
-        if not self.tokens or self.tokens[0].type == 'EOF':
-            return []
+        if not self.tokens or self.tokens[0].type == 'EOF': return []
             
         while not self.is_eof():
             try:
+                # _parse_statement will now handle skipping its own leading separator newlines
+                # or returning a PdsBlankLine node if appropriate.
                 node = self._parse_statement()
                 if node:
                     self.root_nodes.append(node)
-                else:
-                    if not self.is_eof(): 
-                        self._error("Parser did not advance or produce a node before EOF.")
-                        break 
+                elif not self.is_eof(): # If node is None but not EOF, something unexpected
+                    # This case should be rare if _parse_statement correctly consumes or errors.
+                    # It might happen if _parse_statement returns None for EOF effectively.
+                    # Check if we are at EOF after _parse_statement returned None.
+                    # The while loop condition `not self.is_eof()` handles exiting.
+                    # If _parse_statement returns None and it's not EOF, that's an issue.
+                    # The EOF case in _parse_statement returning None is now explicit.
+                     self._error("Parser yielded no node and is not at EOF.") # Safety error
             except ValueError as parse_err:
                 print(f"Parser error in {filepath}: {parse_err}")
                 return [] 
