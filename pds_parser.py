@@ -35,22 +35,18 @@ class PdsLexer:
             '{': 'LBRACE',
             '}': 'RBRACE',
             '=': 'EQUALS',
-            # Add other single-character operators if PDS uses them outside identifiers
-            # For now, combined operators are handled by IDENTIFIER or specific regex
         }
         
         # Order of patterns matters for greedy matching (e.g., COMMENT before IDENTIFIER)
         # IDENTIFIER regex adjusted: does NOT include whitespace unless part of a quoted string (handled by STRING type)
-        # Operators like >=, <=, !=, ==, ?= are now explicitly matched if they are standalone operators.
         self.patterns = [
             ('COMMENT', r'#.*'),
             ('OPERATOR', r'(?:>=|<=|==|!=|\?=|>|<|!)'), # Multi-char operators (e.g., ?=)
             ('STRING', r'"[^"]*"'), # Quoted strings
             ('NUMBER', r'-?\d+(?:\.\d+)?'),
             # IDENTIFIER: Matches alphanumeric, _, ., :, @, - characters.
-            # It must not match operators, numbers, or start with a digit if it's an identifier.
-            # Using a lookahead to ensure it doesn't consume beyond a separator.
-            ('IDENTIFIER', r'[\w\.:@\-]+(?:[\w\.:@\-]*[\w\.:@\-])?'), # Adjusted IDENTIFIER pattern
+            # This pattern correctly captures things like "scripted_trigger", "scope:barony.title_province"
+            ('IDENTIFIER', r'[\w\.:@\-]+(?:[\w\.:@\-]*[\w\.:@\-])?'), 
         ]
         
         # Compile patterns for efficiency
@@ -102,16 +98,9 @@ class PdsLexer:
                 match = pattern_regex.match(self.text, self.pos)
                 if match:
                     token_value_raw = match.group(0)
-                    # Special handling for IDENTIFIER: strip leading/trailing whitespace if any
-                    # (though IDENTIFIER pattern should ideally avoid capturing it)
-                    # For COMMENT, store without # and leading/trailing whitespace
+                    # Special handling for COMMENT: store text after '#' and stripped
                     if token_type == 'COMMENT':
                         self._add_token_and_advance(token_type, token_value_raw[1:].strip(), len(token_value_raw))
-                    elif token_type == 'IDENTIFIER':
-                         # If IDENTIFIER ends with whitespace due to lookahead (which it shouldn't with my new regex)
-                         # or if it was designed to capture spaces within the identifier (like "some key")
-                         # strip it here. My new IDENTIFIER regex should NOT capture whitespace.
-                        self._add_token_and_advance(token_type, token_value_raw.strip(), len(token_value_raw))
                     else:
                         self._add_token_and_advance(token_type, token_value_raw, len(token_value_raw))
                     matched = True
@@ -130,14 +119,13 @@ class PdsLexer:
 
 class PdsNode:
     """Base class for all elements in the PDS script tree."""
-    def __init__(self, line_number=-1): # raw_line and indent_level will be derived during reconstruction
+    def __init__(self, line_number=-1): 
         self.line_number = line_number
         self.indent_level = 0 # Will be set by the parser when adding to block
 
     def to_string(self, current_indent=0):
         # This method MUST be overridden by all concrete node types.
         # It should reconstruct the string representation of the node.
-        # For base class, it's a structural error if called.
         raise NotImplementedError(f"to_string() not implemented for {self.__class__.__name__}")
 
     def __repr__(self):
@@ -224,7 +212,7 @@ class PdsKeyValuePair(PdsNode):
 
 
 class PdsList(PdsNode): 
-    def __init__(self, key, values, line_number=-1, comment_text=None):
+    def __init__(self, key, values, line_number=-1, comment_text=None): 
         super().__init__(line_number=line_number)
         self.key = key
         self.values = values 
@@ -396,10 +384,11 @@ class PdsParser:
             token_info = f"at '{self.current_token.value}' (type: {self.current_token.type}) on line {self.current_token.line}, column {self.current_token.column}"
         raise ValueError(f"Parser Error: {message} {token_info}")
 
-    def _peek(self):
-        """Returns the current token without consuming it."""
-        if self.current_token_index < len(self.tokens):
-            return self.tokens[self.current_token_index]
+    def _peek(self, offset=0):
+        """Returns the token at the current position + offset without consuming it."""
+        idx = self.current_token_index + offset
+        if idx < len(self.tokens):
+            return self.tokens[idx]
         return PdsToken('EOF', '', -1, -1) # Return EOF token if at end
 
     def _advance(self):
@@ -425,11 +414,11 @@ class PdsParser:
         return PdsComment(token.value, token.line)
 
     def _parse_blank_line(self):
-        token = self._consume('NEWLINE') # Only consuming one NEWLINE for a blank line
-        # Logic to handle multiple NEWLINEs, or sequence of NEWLINEs
-        # For simplicity, if we get a NEWLINE token, we assume it's a blank line node.
-        # The lexer handles multiple raw newlines into multiple NEWLINE tokens.
-        return PdsBlankLine(token.line)
+        first_line = self._peek().line # Get line number from the first NEWLINE token
+        self._consume('NEWLINE')
+        while self._peek().type == 'NEWLINE': # Consume all consecutive NEWLINE tokens
+            self._advance()
+        return PdsBlankLine(first_line)
 
     def _parse_identifier(self):
         token = self._consume('IDENTIFIER')
@@ -437,123 +426,208 @@ class PdsParser:
 
     def _parse_value(self):
         # A value can be an IDENTIFIER, NUMBER, or STRING
+        # Crucially, if PDS allows blocks as values (e.g. for operators like NOT = { ... }),
+        # this method needs to handle LBRACE and dispatch to _parse_block.
         token = self._peek()
-        if token.type in ['IDENTIFIER', 'NUMBER', 'STRING']:
+        if token.type == 'LBRACE':
+            self._advance() # Consume the LBRACE
+            # Blocks that are values don't have an explicit key from the token stream
+            # (the key is the parent's key/operator combination).
+            # We'll pass an empty string as a placeholder key.
+            return self._parse_block("", token.line) 
+        elif token.type in ['IDENTIFIER', 'NUMBER', 'STRING']:
             self._advance()
             return token.value
-        self._error(f"Expected a value (IDENTIFIER, NUMBER, or STRING), got {token.type}")
+        self._error(f"Expected a value (IDENTIFIER, NUMBER, STRING, or LBRACE), got {token.type}")
 
-    def _parse_key_value_pair(self):
-        key_token = self._consume('IDENTIFIER')
-        self._consume('EQUALS')
+    def _parse_key_value_pair(self, key_part):
+        # key_part is the IDENTIFIER (or combined IDENTIFIERs) before '='
+        self._consume('EQUALS') # Consume the '='
         value = self._parse_value()
-        return PdsKeyValuePair(key_token.value, value, key_token.line)
+        return PdsKeyValuePair(key_part, value, self.current_token.line) # Use line of current token for value
 
-    def _parse_operator_condition(self):
-        key_token = self._consume('IDENTIFIER')
-        operator_token = self._consume('OPERATOR')
-        value = self._parse_value()
-        return PdsOperatorCondition(key_token.value, operator_token.value, value, key_token.line)
+    def _parse_operator_condition(self, key_part):
+        # key_part is the IDENTIFIER (or combined IDENTIFIERs) before operator
+        operator_token = self._consume('OPERATOR') # Consume the OPERATOR
+        value = self._parse_value() # This will now handle LBRACE if it's a block value
+        return PdsOperatorCondition(key_part, operator_token.value, value, self.current_token.line)
 
-    def _parse_list(self, key_value, line_number):
-        # Already consumed KEY and EQUALS, now expect LBRACE
+    def _parse_list(self, key_part, line_number): 
+        # key_part is the IDENTIFIER (or combined IDENTIFIERs) before '=' and '{'
+        # Assumes '=' and '{' have already been consumed by _parse_statement if it decided it's a list.
         values = []
         
         while self._peek().type != 'RBRACE' and not self.is_eof():
-            value_token = self._peek()
-            if value_token.type in ['IDENTIFIER', 'NUMBER', 'STRING']:
+            token = self._peek()
+            if token.type in ['IDENTIFIER', 'NUMBER', 'STRING']:
                 values.append(self._parse_value())
-            elif value_token.type == 'COMMENT': # Allow comments inside lists
-                # For simplicity, comments inside lists are currently ignored for list values,
-                # but could be parsed as PdsComment nodes if needed.
-                self._advance() # Consume comment token
-            elif value_token.type == 'NEWLINE': # Allow newlines inside lists
-                self._advance() # Consume newline token
+            elif token.type == 'COMMENT': 
+                self._advance() # Consume comment token, don't add to list values
+            elif token.type == 'NEWLINE': 
+                self._advance() # Consume newline token, don't add to list values
             else:
-                self._error(f"Expected value, comment, or NEWLINE in list, got {value_token.type}")
+                # If we encounter another structural token (like EQUALS, LBRACE, OPERATOR), it means
+                # this is likely NOT a simple list, or the file syntax is malformed for a list.
+                # In PDS, lists are typically simple space-separated values.
+                self._error(f"Unexpected token {token.type} inside PdsList. Lists expect simple values.")
         
-        self._consume('RBRACE')
-        return PdsList(key_value, values, line_number)
+        self._consume('RBRACE') # Consume the closing brace
+        return PdsList(key_part, values, line_number) 
 
-    def _parse_block(self, key_value, line_number):
-        # Already consumed KEY (or KEY OPERATOR) and EQUALS (if present), now expect LBRACE
-        block_node = PdsBlock(key_value, line_number)
+    def _parse_block(self, key_part, line_number): 
+        # key_part is the IDENTIFIER (or combined IDENTIFIERs) before '{'
+        # Assumes '{' has already been consumed by _parse_statement
+        block_node = PdsBlock(key_part, line_number) 
         
-        # Consume tokens until RBRACE or EOF
+        # Add the block to the stack
+        self.stack.append(block_node)
+
         while self._peek().type != 'RBRACE' and not self.is_eof():
             child_node = self._parse_statement() # Recursively parse children
             if child_node:
                 block_node.add_child(child_node)
             else:
-                # Handle unparseable tokens or break out if unhandled
-                if self._peek().type != 'RBRACE': # Prevent infinite loop on unhandled tokens
-                    self._error(f"Could not parse statement inside block, current token: {self._peek().type}")
+                if self._peek().type != 'RBRACE' and not self.is_eof():
+                    self._error(f"Could not parse statement inside block, current token: {self._peek()}")
         
         self._consume('RBRACE') # Consume the closing brace
+        
+        # Pop the block from the stack
+        if self.stack and self.stack[-1] is block_node: # Ensure we pop the correct block
+            self.stack.pop()
+        else:
+            self._error("Mismatched closing brace: Stack inconsistency")
+        
         return block_node
 
     def _parse_statement(self):
-        """Parses a single statement, which can be a KV pair, Operator Condition, List, Block, Comment, or Blank Line."""
+        """Parses a single statement based on the current token."""
         token = self._peek()
-        line_number = token.line # Get line number from the starting token
+        line_number = token.line 
 
         if token.type == 'COMMENT':
             return self._parse_comment()
         elif token.type == 'NEWLINE':
             return self._parse_blank_line()
         elif token.type == 'IDENTIFIER':
-            # Look ahead to determine type: KV, Operator Condition, List, or Block
-            next_token = self.tokens[self.current_token_index + 1] if self.current_token_index + 1 < len(self.tokens) else None
+            # Store the first IDENTIFIER (potential key or first part of multi-part key)
+            first_key_part = self._peek().value 
             
-            if next_token and next_token.type == 'EQUALS':
-                if self.tokens[self.current_token_index + 2].type == 'LBRACE': # key = {
-                    # Consume key and equals, then pass to parse_block/parse_list
-                    key = self._consume('IDENTIFIER').value
-                    self._consume('EQUALS')
+            # Look at the token AFTER the first IDENTIFIER (using _peek(1))
+            next_token_type = self._peek(1).type
+            
+            if next_token_type == 'EQUALS': # Pattern: IDENTIFIER = ...
+                # IDENTIFIER = LBRACE (Block or List)
+                if self._peek(2).type == 'LBRACE': 
+                    self._consume('IDENTIFIER') # Consume key
+                    self._consume('EQUALS') # Consume =
+                    self._consume('LBRACE') # Consume {
+                    
+                    # Heuristic to distinguish between PdsList and PdsBlock:
+                    # Peek ahead from current_token_index (which is now after LBRACE)
+                    peek_idx_after_lbrace = self.current_token_index
+                    while peek_idx_after_lbrace < len(self.tokens) and \
+                          self.tokens[peek_idx_after_lbrace].type in ['NEWLINE', 'COMMENT']:
+                        peek_idx_after_lbrace += 1
+                    
+                    # Assume it's a block if any structured token (EQUALS, OPERATOR, LBRACE)
+                    # is found within the inner content before the RBRACE.
+                    # Otherwise, it's a list.
+                    is_block = False
+                    temp_idx = peek_idx_after_lbrace # Start checking from the first significant token after LBRACE
+                    brace_balance = 0 # Track balance for potential nested blocks
+                    
+                    while temp_idx < len(self.tokens) and self.tokens[temp_idx].type != 'RBRACE' and not self.is_eof():
+                        current_check_token = self.tokens[temp_idx]
+                        
+                        if current_check_token.type == 'LBRACE':
+                            brace_balance += 1
+                        elif current_check_token.type == 'RBRACE':
+                            brace_balance -= 1 # Should ideally not go negative if parsing valid syntax
+                        
+                        # Only check for structural tokens at the current top-level (brace_balance == 0)
+                        # inside the { ... }
+                        if brace_balance == 0:
+                            if current_check_token.type in ['EQUALS', 'OPERATOR', 'LBRACE']:
+                                # If we find any structural token, it's a block.
+                                is_block = True
+                                break
+                            # Also check if an IDENTIFIER is immediately followed by EQUALS/OPERATOR/LBRACE
+                            if current_check_token.type == 'IDENTIFIER' and \
+                               self._peek(temp_idx - self.current_token_index + 1).type in ['EQUALS', 'OPERATOR', 'LBRACE']:
+                                is_block = True
+                                break
+                        
+                        temp_idx += 1
+                    
+                    if is_block:
+                        return self._parse_block(f"{first_key_part} =", line_number) 
+                    else: # If not a block (only simple values or empty), it's a list.
+                        return self._parse_list(f"{first_key_part} =", line_number) 
+                else: # Pattern: IDENTIFIER = VALUE (Key Value Pair)
+                    self._consume('IDENTIFIER') # Consume key
+                    return self._parse_key_value_pair(f"{first_key_part}") 
+            
+            elif next_token_type == 'OPERATOR': # Pattern: IDENTIFIER OPERATOR ...
+                # Look ahead to see if it's IDENTIFIER OPERATOR LBRACE or IDENTIFIER OPERATOR VALUE
+                # Find the first significant token after the operator (skip newlines/comments)
+                peek_idx_after_operator = self.current_token_index + 2 # Start 2 tokens ahead (after ID and OP)
+                while peek_idx_after_operator < len(self.tokens) and \
+                      self.tokens[peek_idx_after_operator].type in ['NEWLINE', 'COMMENT']:
+                    peek_idx_after_operator += 1
+                
+                # Determine the type of the first *significant* token after the operator
+                actual_token_after_operator_type = self.tokens[peek_idx_after_operator].type if peek_idx_after_operator < len(self.tokens) else 'EOF'
+
+                if actual_token_after_operator_type == 'LBRACE': # Pattern: IDENTIFIER OPERATOR LBRACE (This is a block!)
+                    self._consume('IDENTIFIER') # Consume key
+                    operator_token = self._consume('OPERATOR') # Consume operator
                     self._consume('LBRACE') # Consume LBRACE
                     
-                    # Need to check if it's a list or a block here
-                    # PDS convention: key = { item1 item2 } is a list
-                    #                  key = { nested_key = value } is a block
+                    # Combine key and operator for the block's display key
+                    block_display_key = f"{first_key_part} {operator_token.value}" 
                     
-                    # Heuristic: If the next non-whitespace/non-comment token is an IDENTIFIER followed by EQUALS/OPERATOR/LBRACE,
-                    # it's a block. Otherwise, it's a list.
+                    if operator_token.value == '=': # If the operator is "=", format key as "key ="
+                        block_display_key = f"{first_key_part} =" 
                     
-                    # Peek after LBRACE to see if it's a structured element or just values.
-                    peek_after_lbrace_index = self.current_token_index
-                    while peek_after_lbrace_index < len(self.tokens) and \
-                          self.tokens[peek_after_lbrace_index].type in ['NEWLINE', 'COMMENT']:
-                        peek_after_lbrace_index += 1
-                    
-                    if peek_after_lbrace_index < len(self.tokens) and \
-                       self.tokens[peek_after_lbrace_index].type == 'IDENTIFIER':
-                        
-                        peek_after_key_index = peek_after_lbrace_index + 1
-                        if peek_after_key_index < len(self.tokens) and \
-                           self.tokens[peek_after_key_index].type in ['EQUALS', 'OPERATOR', 'LBRACE']:
-                            # It's a block (e.g., 'key = { nested_key = value }' or 'key = { nested_key { } }')
-                            # Pass the key (including " = "), and line number to _parse_block.
-                            return self._parse_block(key + " =", line_number)
-                    
-                    # If not a block, it's a list.
-                    return self._parse_list(key + " =", line_number)
-                else: # key = value
-                    return self._parse_key_value_pair()
-            elif next_token and next_token.type == 'OPERATOR': # key OPERATOR value
-                return self._parse_operator_condition()
-            elif next_token and next_token.type == 'LBRACE': # key { (without '=') - e.g., "effect = { random_event = { ... }}" or "owner = { ... } (if no '=')"
-                # PDS often allows "key {" for blocks like "scripted_effect = { ... }"
-                # In this case, the KEY does not include "=" or operator
-                key = self._consume('IDENTIFIER').value
-                self._consume('LBRACE')
-                # This is always a block if it's key {
-                return self._parse_block(key, line_number)
-            else:
+                    return self._parse_block(block_display_key, line_number)
+                else: # Pattern: IDENTIFIER OPERATOR VALUE (Regular operator condition)
+                    self._consume('IDENTIFIER') # Consume key
+                    return self._parse_operator_condition(first_key_part) 
+
+            elif next_token_type == 'LBRACE': # Pattern: IDENTIFIER LBRACE (Block without '=') e.g., "scripted_trigger {", "NOR {"
+                self._consume('IDENTIFIER') # Consume key
+                self._consume('LBRACE') # Consume {
+                # The key is just the identifier, not including "=" or operator.
+                return self._parse_block(first_key_part, line_number) 
+            
+            elif next_token_type == 'IDENTIFIER': # Pattern: IDENTIFIER IDENTIFIER ... (Multi-part key for block or condition)
+                self._consume('IDENTIFIER') # Consume first key part
+                second_key_part = self._consume('IDENTIFIER').value # Consume second key part
+                combined_key = f"{first_key_part} {second_key_part}"
+                
+                # Look at the token AFTER the second IDENTIFIER (which is current_token now)
+                third_token_type = self._peek().type 
+                
+                if third_token_type == 'EQUALS': # Pattern: IDENTIFIER IDENTIFIER = ...
+                    self._consume('EQUALS') # Consume =
+                    if self._peek().type == 'LBRACE': # Pattern: IDENTIFIER IDENTIFIER = LBRACE (Multi-part key Block)
+                        self._consume('LBRACE') # Consume {
+                        return self._parse_block(f"{combined_key} =", line_number) 
+                    else: # Pattern: IDENTIFIER IDENTIFIER = VALUE (Multi-part Key Value Pair)
+                        return self._parse_key_value_pair(f"{combined_key}") 
+                elif third_token_type == 'LBRACE': # Pattern: IDENTIFIER IDENTIFIER LBRACE (Multi-part key Block without '=')
+                    self._consume('LBRACE') # Consume {
+                    return self._parse_block(combined_key, line_number) 
+                elif third_token_type == 'OPERATOR': # Pattern: IDENTIFIER IDENTIFIER OPERATOR VALUE (Multi-part Key Operator Condition)
+                    return self._parse_operator_condition(combined_key)
+                else:
+                    self._error(f"Unexpected token sequence after multi-part IDENTIFIERs: {self._peek().type}")
+            
+            else: # If a single IDENTIFIER is not followed by expected sequence
                 self._error(f"Unexpected token sequence starting with {token.type}. Expected a statement.")
         
-        # If execution reaches here, it means no known statement type matched
         self._error(f"Unexpected token: {token.type} - {token.value}")
-        return None # Should not be reached
 
     def parse_file(self, filepath):
         if not os.path.exists(filepath):
@@ -574,8 +648,6 @@ class PdsParser:
         lexer = PdsLexer(text_content)
         self.tokens = lexer.tokenize()
         
-        # Start parsing the document
-        self.root_nodes = []
         self.current_token_index = 0
         self.current_token = self._peek() # Initialize current_token
         
@@ -585,9 +657,7 @@ class PdsParser:
             if node:
                 self.root_nodes.append(node)
             else:
-                # Advance to prevent infinite loop on unhandled tokens
                 self._error(f"Failed to parse statement at top level, current token: {self._peek()}")
-                break # Break to avoid endless loop on error
         
         return self.root_nodes
 
