@@ -2,7 +2,7 @@ import re
 import os
 import difflib
 
-# --- PdsLexer and PdsToken (Same as previous, no changes needed here) ---
+# --- PdsLexer and PdsToken ---
 
 class PdsToken:
     """Represents a token found during lexical analysis."""
@@ -37,7 +37,8 @@ class PdsLexer:
         }
         
         self.patterns = [
-            ('COMMENT', r'#.*'),
+            # COMMENT: Capture everything after the #, including leading/trailing whitespace
+            ('COMMENT', r'#.*'), 
             ('OPERATOR', r'(?:>=|<=|==|!=|\?=|>|<|!)'), 
             ('STRING', r'"[^"]*"'), 
             ('NUMBER', r'-?\d+(?:\.\d+)?'),
@@ -88,7 +89,8 @@ class PdsLexer:
                 if match:
                     token_value_raw = match.group(0)
                     if token_type == 'COMMENT':
-                        self._add_token_and_advance(token_type, token_value_raw[1:].strip(), len(token_value_raw))
+                        # Preserve original leading space after '#'
+                        self._add_token_and_advance(token_type, token_value_raw[1:], len(token_value_raw))
                     else:
                         self._add_token_and_advance(token_type, token_value_raw, len(token_value_raw))
                     matched = True
@@ -102,7 +104,7 @@ class PdsLexer:
         self.tokens.append(PdsToken('EOF', '', self.line, self.column)) 
         return self.tokens
 
-# --- PdsNode Classes (No changes needed) ---
+# --- PdsNode Classes (Major changes to PdsComment and PdsBlock to_string) ---
 
 class PdsNode:
     def __init__(self, line_number=-1): 
@@ -149,7 +151,8 @@ class PdsComment(PdsNode):
 
     def to_string(self, current_indent=0, is_inline_context=False): # is_inline_context not used here
         indent_str = " " * current_indent
-        return f"{indent_str}# {self.comment_text}\n"
+        # No hardcoded space after '#' - rely on lexer to preserve it if present
+        return f"{indent_str}#{self.comment_text}\n"
 
     def copy(self):
         new_node = PdsComment(comment_text=self.comment_text, line_number=self.line_number)
@@ -160,7 +163,7 @@ class PdsBlankLine(PdsNode):
         super().__init__(line_number=line_number)
 
     def to_string(self, current_indent=0, is_inline_context=False): # is_inline_context not used here
-        return "\n" # A blank line is represented by a single newline
+        return "\n" 
 
     def copy(self):
         new_node = PdsBlankLine(line_number=self.line_number)
@@ -182,10 +185,8 @@ class PdsKeyValuePair(PdsNode):
         line_ending = "\n"
 
         if isinstance(self.value, PdsBlock):
-            # Pass is_inline_context=True to the block's to_string when it's a value
+            # Pass current_indent but the block itself will ignore it for inline rendering
             value_output_str = self.value.to_string(current_indent, is_inline_context=True)
-            # If the block itself decided to render inline, it will already have the braces
-            # If not, it will be multi-line.
             line_ending = "" # Block's string already has its final newline
         elif isinstance(self.value, str):
             must_quote = (
@@ -269,7 +270,7 @@ class PdsOperatorCondition(PdsNode):
         line_ending = "\n"
 
         if isinstance(self.value, PdsBlock):
-            # Pass is_inline_context=True to the block's to_string when it's a value
+            # Pass current_indent but the block itself will ignore it for inline rendering
             value_output_str = self.value.to_string(current_indent, is_inline_context=True)
             line_ending = "" # Block's string already has its final newline
         elif isinstance(self.value, str):
@@ -317,7 +318,6 @@ class PdsBlock(PdsNode):
         indent_str = " " * current_indent
         
         # Heuristic for inline block rendering
-        # If it's a value block AND has one child AND that child is not a block/list/comment/blankline
         is_inline_candidate = (
             is_inline_context and # Only consider inline if context demands it
             len(self.children) == 1 and
@@ -327,14 +327,11 @@ class PdsBlock(PdsNode):
         )
 
         if is_inline_candidate:
-            # Render compactly: { child_content_stripped }
-            # The child's own to_string will apply indentation, so we strip it.
-            # We call to_string on the child without any additional indent, then strip its actual output
-            child_content_compact = self.children[0].to_string(0).strip()
-            # If the block has a key (not anonymous), it's "key = { child }"
-            # If it's anonymous (key=""), it's "{ child }"
-            key_part = f"{self.key} " if self.key else ""
-            return f"{indent_str}{key_part}{{{child_content_compact}}}"
+            # When rendering inline as a value, the block itself should not apply `current_indent`.
+            # Its parent (KVP or OperatorCondition) handles the overall line indentation.
+            child_content_compact = self.children[0].to_string(0).strip() # Pass 0 indent to child, strip its output
+            key_part_for_block = f"{self.key} " if self.key else "" # This self.key is the block's own key
+            return f"{key_part_for_block}{{{child_content_compact}}}"
         
         # Default: Render multi-line indented block
         output_lines = []
@@ -409,7 +406,7 @@ class PdsBlock(PdsNode):
         else: self.children.append(new_child_node)
         return True
 
-# --- PdsParser (Significant changes for newline handling) ---
+# --- PdsParser (No changes needed from previous iteration) ---
 class PdsParser:
     def __init__(self):
         self.tokens = []
@@ -686,8 +683,6 @@ class PdsParser:
         while not self.is_eof():
             token = self._peek()
             if token.type == 'NEWLINE':
-                # A PdsBlankLine node is created only for sequences of two or more newlines.
-                # A single newline is simply consumed as a separator.
                 if self._peek(1).type == 'NEWLINE': 
                     self.root_nodes.append(self._parse_blank_line_node())
                 else: # Single newline, just consume as separator
@@ -708,7 +703,6 @@ class PdsParser:
     def _nodes_to_string(nodes_list):
         output = []
         for node in nodes_list:
-            # Ensure root nodes have indent_level 0 if not otherwise set
             if node.indent_level is None : node.indent_level = 0 # Should be set by parser
             output.append(node.to_string(node.indent_level)) 
         return "".join(output)
