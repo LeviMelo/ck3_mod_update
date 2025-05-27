@@ -179,32 +179,42 @@ class PdsKeyValuePair(PdsNode):
         self.value = value 
         self.comment_text_on_line = comment_text
 
-    def to_string(self, current_indent=0, is_inline_context=False):
+    def to_string(self, current_indent=0, is_inline_context_ignored=False): # Renamed param
         indent_str = " " * current_indent
-        value_output_str = ""
+        line_content_start = f"{indent_str}{self.key} = "
+        value_actual_str = ""
         line_ending = "\n"
 
         if isinstance(self.value, PdsBlock):
-            # Pass current_indent but the block itself will ignore it for inline rendering
-            value_output_str = self.value.to_string(current_indent, is_inline_context=True)
-            line_ending = "" # Block's string already has its final newline
-        elif isinstance(self.value, str):
-            must_quote = (
-                ' ' in self.value or '\t' in self.value or
-                '#' in self.value or '=' in self.value or
-                '{' in self.value or '}' in self.value or
-                '"' in self.value or not self.value 
-            )
-            is_simple_identifier = re.fullmatch(PdsKeyValuePair._lexer_identifier_pattern, self.value)
-            
-            if must_quote or (self.value and not is_simple_identifier): 
-                 value_output_str = f'"{self.value}"'
+            block_node = self.value
+            # PdsBlock.to_string will use current_indent for its own structure if multi-line,
+            # or return a compact string like "{{ child }}" if it's an inline candidate.
+            # The is_inline_context=True tells the block it's being used as a value.
+            block_render_str = block_node.to_string(current_indent, is_inline_context=True)
+
+            if block_render_str.strip().startswith("{") and not "\n" in block_render_str:
+                # Compact inline block, e.g., "{{ child_content }}"
+                value_actual_str = block_render_str.strip() # -> "{child_content}"
+                # line_content_start already has "key = "
             else:
-                value_output_str = self.value
+                # Multi-line block. block_render_str is like "    {\n      child\n    }\n"
+                # It already starts with the correct current_indent.
+                # We want to avoid "key =     {...}", so remove the redundant indent from block_render_str
+                if block_render_str.startswith(indent_str):
+                    value_actual_str = block_render_str[len(indent_str):]
+                else: # Should not happen if block is multi-line and correctly indented
+                    value_actual_str = block_render_str
+                line_ending = "" # Block's string has its own newlines
+        elif isinstance(self.value, str):
+            # ... (your existing string quoting logic) ...
+            must_quote = (' ' in self.value or '\t' in self.value or '#' in self.value or '=' in self.value or '{' in self.value or '}' in self.value or '"' in self.value or not self.value)
+            is_simple_identifier = re.fullmatch(PdsKeyValuePair._lexer_identifier_pattern, self.value)
+            if must_quote or (self.value and not is_simple_identifier): value_actual_str = f'"{self.value}"'
+            else: value_actual_str = self.value
         else: 
-            value_output_str = str(self.value)
+            value_actual_str = str(self.value)
         
-        line_content = f"{indent_str}{self.key} = {value_output_str}"
+        line_content = line_content_start + value_actual_str.lstrip() # lstrip to remove any leading space from value if it's "{...}"
         if self.comment_text_on_line: 
             line_content += f" # {self.comment_text_on_line}"
         
@@ -264,29 +274,34 @@ class PdsOperatorCondition(PdsNode):
         self.value = value        
         self.comment_text_on_line = comment_text
 
-    def to_string(self, current_indent=0, is_inline_context=False):
+    def to_string(self, current_indent=0, is_inline_context_ignored=False): # Renamed param
         indent_str = " " * current_indent
-        value_output_str = ""
+        line_content_start = f"{indent_str}{self.key} {self.operator} "
+        value_actual_str = ""
         line_ending = "\n"
 
         if isinstance(self.value, PdsBlock):
-            # Pass current_indent but the block itself will ignore it for inline rendering
-            value_output_str = self.value.to_string(current_indent, is_inline_context=True)
-            line_ending = "" # Block's string already has its final newline
-        elif isinstance(self.value, str):
-            must_quote = (
-                ' ' in self.value or '\t' in self.value or
-                '#' in self.value or '=' in self.value or
-                '{' in self.value or '}' in self.value or
-                '"' in self.value or not self.value
-            )
-            is_simple_identifier = re.fullmatch(PdsKeyValuePair._lexer_identifier_pattern, self.value)
-            if must_quote or (self.value and not is_simple_identifier):
-                 value_output_str = f'"{self.value}"'
-            else: value_output_str = self.value
-        else: value_output_str = str(self.value)
+            block_node = self.value
+            block_render_str = block_node.to_string(current_indent, is_inline_context=True)
 
-        line_content = f"{indent_str}{self.key} {self.operator} {value_output_str}"
+            if block_render_str.strip().startswith("{") and not "\n" in block_render_str:
+                value_actual_str = block_render_str.strip()
+            else:
+                if block_render_str.startswith(indent_str):
+                    value_actual_str = block_render_str[len(indent_str):]
+                else:
+                    value_actual_str = block_render_str
+                line_ending = ""
+        elif isinstance(self.value, str):
+            # ... (your existing string quoting logic) ...
+            must_quote = (' ' in self.value or '\t' in self.value or '#' in self.value or '=' in self.value or '{' in self.value or '}' in self.value or '"' in self.value or not self.value)
+            is_simple_identifier = re.fullmatch(PdsKeyValuePair._lexer_identifier_pattern, self.value) # Assuming pattern is accessible
+            if must_quote or (self.value and not is_simple_identifier): value_actual_str = f'"{self.value}"'
+            else: value_actual_str = self.value
+        else: 
+            value_actual_str = str(self.value)
+        
+        line_content = line_content_start + value_actual_str.lstrip() # lstrip to remove any leading space from value if it's "{...}"
         if self.comment_text_on_line:
             line_content += f" # {self.comment_text_on_line}"
         
@@ -303,7 +318,7 @@ class PdsOperatorCondition(PdsNode):
         )
         return self._base_copy_attrs(new_node)
 
-class PdsBlock(PdsNode):
+class PdsBlock(PdsNode): # Ensure these methods are part of PdsBlock
     def __init__(self, key, line_number=-1, comment_text=None):
         super().__init__(line_number=line_number)
         self.key = key 
@@ -314,26 +329,22 @@ class PdsBlock(PdsNode):
         node.indent_level = self.indent_level + 4 # Standard PDS indent
         self.children.append(node)
 
-    def to_string(self, current_indent=0, is_inline_context=False): # Added is_inline_context
+    def to_string(self, current_indent=0, is_inline_context=False): # Your provided version
         indent_str = " " * current_indent
         
-        # Heuristic for inline block rendering
         is_inline_candidate = (
-            is_inline_context and # Only consider inline if context demands it
+            is_inline_context and 
             len(self.children) == 1 and
             isinstance(self.children[0], (PdsKeyValuePair, PdsOperatorCondition)) and
-            not isinstance(self.children[0].value, PdsBlock) and # Ensure child's value isn't a block
-            not self.comment_text_on_line # No inline comment on the { line itself
+            not isinstance(self.children[0].value, PdsBlock) and 
+            not self.comment_text_on_line 
         )
 
         if is_inline_candidate:
-            # When rendering inline as a value, the block itself should not apply `current_indent`.
-            # Its parent (KVP or OperatorCondition) handles the overall line indentation.
-            child_content_compact = self.children[0].to_string(0).strip() # Pass 0 indent to child, strip its output
-            key_part_for_block = f"{self.key} " if self.key else "" # This self.key is the block's own key
-            return f"{key_part_for_block}{{{child_content_compact}}}"
+            child_content_compact = self.children[0].to_string(0).strip() 
+            key_part_for_block = f"{self.key} " if self.key else "" 
+            return f"{key_part_for_block}{{{child_content_compact}}}" # For anonymous, this is "{{child_compact}}"
         
-        # Default: Render multi-line indented block
         output_lines = []
         open_brace_line_content = ""
         if self.key: 
@@ -346,14 +357,19 @@ class PdsBlock(PdsNode):
         
         output_lines.append(indent_str + open_brace_line_content + "\n")
 
-        # Children are rendered with their own set indent_level
+        # Children's indent_level is set by add_child relative to this block's indent_level.
+        # So, they should use their own self.indent_level for rendering.
+        # The current_indent here is for THIS block's braces.
+        children_expected_indent = current_indent + 4
         for child in self.children:
-            output_lines.append(child.to_string(child.indent_level)) 
+            # If child.indent_level is correctly set, child.to_string(child.indent_level) is fine.
+            # For safety, or if indent_levels might be stale after tree manipulation not using add_child:
+            output_lines.append(child.to_string(children_expected_indent)) 
         
         output_lines.append(f"{indent_str}}}\n") 
         return "".join(output_lines)
     
-    def find_node(self, key_path):
+    def find_node(self, key_path): # Your provided version
         if isinstance(key_path, str): key_path = key_path.split('.')
         if not key_path: return None
         current_nodes_to_search = self.children
@@ -370,7 +386,7 @@ class PdsBlock(PdsNode):
             else: return None 
         return None 
 
-    def copy(self):
+    def copy(self): # Your provided version
         new_node = PdsBlock(
             key=self.key,
             line_number=self.line_number,
@@ -380,30 +396,40 @@ class PdsBlock(PdsNode):
         new_node.children = [child.copy() for child in self.children] 
         return new_node
 
+    # MODIFIED/ENSURED METHODS for indent_level during merge
     def replace_child(self, old_child_identifier, new_child_node):
+        new_child_node.indent_level = self.indent_level + 4 # Ensure new child gets correct indent
         for i, child in enumerate(self.children):
             child_key_str = str(child.key) if hasattr(child, 'key') else None
             if child_key_str == str(old_child_identifier): 
-                self.children[i] = new_child_node; return True
+                self.children[i] = new_child_node
+                return True
         return False
 
-    def remove_child(self, child_identifier):
+    def remove_child(self, child_identifier): # Your provided version
         original_len = len(self.children)
         self.children = [c for c in self.children if not (hasattr(c, 'key') and str(c.key) == str(child_identifier))]
         return len(self.children) < original_len
 
     def add_child_at_appropriate_location(self, new_child_node, target_sibling_identifier=None, after=True):
+        new_child_node.indent_level = self.indent_level + 4 # Ensure new child gets correct indent
+        
         if target_sibling_identifier:
             for i, child in enumerate(self.children):
                 child_key_str = str(child.key) if hasattr(child, 'key') else None
                 if child_key_str == str(target_sibling_identifier): 
-                    self.children.insert(i + 1 if after else i, new_child_node); return True
+                    self.children.insert(i + 1 if after else i, new_child_node)
+                    return True
+        
         last_code_node_idx = -1
         for i in reversed(range(len(self.children))):
             if not isinstance(self.children[i], (PdsComment, PdsBlankLine)):
-                last_code_node_idx = i; break
-        if last_code_node_idx != -1: self.children.insert(last_code_node_idx + 1, new_child_node)
-        else: self.children.append(new_child_node)
+                last_code_node_idx = i
+                break
+        if last_code_node_idx != -1: 
+            self.children.insert(last_code_node_idx + 1, new_child_node)
+        else: 
+            self.children.append(new_child_node)
         return True
 
 # --- PdsParser (No changes needed from previous iteration) ---
