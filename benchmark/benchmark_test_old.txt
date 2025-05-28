@@ -1,0 +1,151 @@
+﻿# benchmark_test_old.txt
+# Base file for PDS Differ benchmark.
+
+# --- Section 1: Primitive Value Changes & Conflicts ---
+primitive_string = "initial_string"
+primitive_number = 100
+primitive_bool = yes
+primitive_float = 1.0
+
+# --- Section 2: Additions, Deletions, Unchanged ---
+# This KVP will be deleted in Mod and Modified in New
+delete_mod_modify_new = { # Comment Old
+	value = 1
+	keep_me = yes # Keep this child Old
+}
+
+# This KVP will be added in Mod only
+# (Absent)
+
+# This KVP will be deleted in New only
+delete_new_only = 123
+
+# This KVP will be modified in Mod, deleted in New
+modify_mod_delete_new = "original"
+
+# This KVP will be deleted in Mod, kept in New
+delete_mod_keep_new = "original"
+
+# This KVP will be kept identical in both
+keep_identical = "unchanged" # Comment Identical
+
+# This comment will be modified in Mod and New
+# This is an original comment
+
+# This blank line will be changed to a comment in Mod and New
+# 
+
+# --- Section 3: Lists ---
+# Simple list, items modified/added/deleted in Mod and New
+simple_list_conflict = { item_a item_b item_c } # Comment List Old
+
+# Multi-line list, adds in Mod and New
+multi_line_list = { # Comment MultiList Old
+	item_1
+	item_2
+}
+
+# List with anonymous blocks - children changed
+list_with_anon_blocks = { # Comment AnonList Old
+	{ block_item_1 = value_1 } # L88 - Comment Anon1 Old
+	{ block_item_2 = value_2 } # L89 - Comment Anon2 Old
+}
+
+# --- Section 4: Blocks ---
+# Simple block, children modified in Mod and New
+simple_block_conflict = { # Comment Block Old
+	child_kvp = base_value # Comment ChildKVP Old
+	child_list = { list_item_x list_item_y } # Comment ChildList Old
+}
+
+# Nested blocks, changes at different levels
+parent_block = { # Comment Parent Old
+	child_block_level1_mod = { # Comment L1Mod Old
+		child_block_level2 = { # Comment L2 Old
+			final_value = "base" # Modified in Mod and New # Comment Final Old
+			# Vanilla adds child here
+		}
+		# Mod adds KVP here
+	}
+	# Mod deletes child_block_level1_new below
+	child_block_level1_new = { # Comment L1New Old
+		should_be_deleted_by_mod = yes
+	}
+	# Vanilla adds block here
+}
+
+# Block modified by Mod (adds KVP), deleted by Vanilla
+modify_mod_delete_new_block = { # Comment ModDelBlock Old
+	initial_child = 1 # Comment InitChild Old
+	# Mod adds new_child_mod here
+}
+
+# Block deleted by Mod, modified by Vanilla (adds KVP)
+delete_mod_modify_new_block = { # Comment DelModBlock Old
+	initial_child = 1 # Comment InitChild Old
+	# Vanilla adds new_child_van here
+}
+
+# --- Section 5: Operator Conditions ---
+condition_example = { # Comment CondBlock Old
+	base_value > 10 # Comment CondItem1 Old
+	always_true = yes # Vanilla changes this KVP # Comment CondItem2 Old
+}
+
+# --- Section 6: Edge Cases & Mixes ---
+# KVP value changes from primitive to block (in Mod)
+kvp_to_block = "its_a_string_originally" # Comment KVPToBlock Old
+
+# Block key changes (simulate by delete+add)
+block_key_change_old = { # Comment KeyChange Old
+	value = 1
+}
+
+# Empty block initially
+empty_block = { # Comment Empty Old
+}
+
+# Block with comments on brace line and child comments
+block_with_comments = { # Initial block comment Old
+	# Initial child comment Old 1
+	# Initial child comment Old 2
+	child = yes # Comment Child Old
+}
+
+# Orphaned nodes (should ideally not happen in valid PDS, but parser might produce)
+# Orphan = "value" # This would be a top-level KVP
+
+# More complex list item modifications
+complex_list_items = { # Comment ComplexList Old
+	{ complex_block = { x = 1 } } # Mod changes x, New adds y # L188 - Comment ComplexAnon Old
+	item_value # Mod deletes, New modifies # L189
+	"quoted string" # Mod modifies # L190
+}
+
+# --- Section 7: Random List / Weighted Blocks Stress Test ---
+# This section tests lists where keys are numbers (weights) and values are blocks.
+# Changes to weights AND internal block content are included.
+random_list_benchmark = { # Comment RandomList Old
+	10 = { # L198 - Weight 10 Old
+		# Comment 10 Block Old
+		item_a = yes # Modified in Mod, Deleted in New
+		item_b = 1 # Modified in Mod and New
+	}
+	20 = { # L203 - Weight 20 Old - Deleted in New, Modified in Mod
+		item_c = "original" # Modified in Mod
+	}
+	30 = { # L206 - Weight 30 Old - Kept in New, Modified in Mod
+		item_d = no # Modified in Mod
+	}
+	40 = { # L209 - Weight 40 Old - Modified in New, Kept in Mod
+		item_e = 1.5 # Modified in New
+	}
+	50 = { # L212 - Weight 50 Old - Kept Identical
+		item_f = "keep" # Kept Identical
+		# Mod adds comment to 50 block
+		# Vanilla adds comment to 50 block
+	}
+	# Mod adds 60={...}
+	# New adds 70={...} (similar to Old 20={...})
+	# New adds 80={...}
+}

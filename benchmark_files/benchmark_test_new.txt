@@ -1,0 +1,163 @@
+﻿# benchmark_test_new.txt
+# New Vanilla version for PDS Differ benchmark.
+
+# --- Section 1: Primitive Value Changes & Conflicts ---
+primitive_string = "vanilla_string_changed"
+primitive_number = 100
+primitive_bool = yes
+primitive_float = 2.0 # Vanilla changes float
+
+# --- Section 2: Additions, Deletions, Unchanged ---
+# This KVP will be deleted in Mod and Modified in New
+delete_mod_modify_new = { # Comment New
+	value = 2 # Vanilla modifies value
+	keep_me = yes
+	vanilla_added_child = no # Vanilla adds child
+}
+
+# This KVP will be added in Mod only (Absent in New)
+# (Absent)
+
+# This KVP will be deleted in New only
+# (Absent)
+
+# This KVP will be modified in Mod, deleted in New
+# (Absent)
+
+# This KVP will be deleted in Mod, kept in New
+delete_mod_keep_new = "original"
+
+# This KVP will be kept identical in both
+keep_identical = "unchanged" # Comment Identical
+
+# This comment will be modified in Mod and New
+# This is an original comment # Vanilla adds to comment
+
+# This blank line will be changed to a comment in Mod and New
+# Vanilla replaced blank with comment
+
+# --- Section 3: Lists ---
+# Simple list, items modified/added/deleted in Mod and New
+simple_list_conflict = { item_a item_v item_e item_added_vanilla } # Vanilla changed b->item_v, c->item_e, added item_added_vanilla
+
+# Multi-line list, adds in Mod and New
+multi_line_list = {
+	item_1
+	item_2
+	item_vanilla_added # Vanilla adds here
+}
+
+# List with anonymous blocks - children changed
+list_with_anon_blocks = {
+	{ block_item_1 = value_1 } # Kept by New
+	{ block_item_2 = vanilla_value_changed } # Vanilla changed value inside
+	{ block_item_3_vanilla = vanilla_added } # Vanilla adds new anon block
+}
+
+# --- Section 4: Blocks ---
+# Simple block, children modified in Mod and New
+simple_block_conflict = { # Vanilla adds comment to block
+	# Initial child comment Old 1 # Vanilla modifies comment 1
+	child_kvp = vanilla_value_changed # Vanilla changes value
+	child_list = { list_item_x list_item_y # Kept original y
+		list_item_vanilla_z # Vanilla adds item to list
+	}
+}
+
+# Nested blocks, changes at different levels
+parent_block = { # Vanilla adds block comment
+	child_block_level1_mod = { # Vanilla adds comment
+		child_block_level2 = {
+			final_value = "vanilla" # Modified in New
+			vanilla_added_kvp = 2 # Vanilla adds child here
+		}
+	}
+	child_block_level1_new = { # Kept by Vanilla (not deleted by Mod in this version)
+		should_be_deleted_by_mod = yes
+	}
+	vanilla_added_block_level1 = { # Vanilla adds block here
+		child = yes
+	}
+}
+
+# Block modified by Mod (adds KVP), deleted by Vanilla
+# (Absent)
+
+# Block deleted by Mod, modified by Vanilla (adds KVP)
+delete_mod_modify_new_block = { # Comment DelModBlock New
+	initial_child = 1
+	new_child_van = yes # Vanilla adds new_child_van here
+}
+
+# --- Section 5: Operator Conditions ---
+condition_example = { # Comment CondBlock Old # Vanilla adds to block comment line
+	# Initial child comment CondItem1 Old # Vanilla modifies comment
+	base_value > 10 # Kept by Vanilla
+	always_true = no # Vanilla changes this KVP's value
+}
+
+# --- Section 6: Edge Cases & Mixes ---
+# KVP value changes from primitive to block (Absent in New)
+kvp_to_block = "its_a_string_originally" # Kept by Vanilla as string
+
+# Block key changes (simulate by delete+add)
+# block_key_change_old = { # Deleted by Vanilla (Old version)
+#	value = 1
+#} # This will result in block_key_change_old being MOD_DELETED_VANILLA_ALSO_DELETED if Mod also deletes it.
+  # If Mod changes key to block_key_change_mod, then it's a delete of old + add of mod.
+  # If New adds block_key_change_new, it's an add from New.
+block_key_change_new = { # Vanilla adds block with new key
+	value = 1
+	vanilla_added = no # Vanilla adds a child
+} # Comment KeyChange New
+
+# Empty block initially
+empty_block = {
+} # Kept identical in New (no comment added by New)
+
+# Block with comments on brace line and child comments
+block_with_comments = { # Initial block comment Old # Vanilla adds to block comment
+	# Initial child comment Old 1 # Vanilla modifies comment 1
+	# Initial child comment Old 2 # Vanilla modifies comment 2
+	child = yes # Kept child
+}
+
+# Orphaned nodes (Absent in New)
+# Orphan = "value"
+
+# More complex list item modifications
+complex_list_items = {
+	{ complex_block = { x = 1 y = 2 } } # New adds y
+	item_value_vanilla_modified # New modifies (Old 'item_value')
+	"quoted string" # Kept identical by New
+}
+
+# --- Section 7: Random List / Weighted Blocks Stress Test ---
+random_list_benchmark = { # Comment RandomList Old # Vanilla adds to block comment line
+	10 = { # L198 - Weight 10 Old - Modified in Mod, New deleted item_a and changed item_b
+		# Comment 10 Block Old # Vanilla modifies comment
+		item_b = 99 # Modified in Mod and New
+		# item_a deleted by New
+	}
+	# 20 = {...} Deleted in New, Modified in Mod
+	30 = { # L206 - Weight 30 Old - Kept in New (item_d=no), Modified in Mod (item_d=yes)
+		item_d = no # Kept in New from Old
+	}
+	40 = { # L209 - Weight 40 Old - Modified in New, Kept in Mod
+		item_e = 2.5 # Modified in New
+		vanilla_added_40 = no # Vanilla adds to 40 block
+	}
+	50 = { # L212 - Weight 50 Old - Kept Identical
+		item_f = "keep" # Kept Identical
+		# Mod adds comment to 50 block
+		# Vanilla adds comment to 50 block
+	}
+	# Mod adds 60={...}
+	70 = { # New adds 70={...} (similar to Old 20={...})
+		item_c = "original" # Content from Old 20
+		new_added_70 = yes # Vanilla adds to 70 block
+	}
+	80 = { # New adds 80={...}
+		item_h = 5 # Vanilla adds to 80 block
+	}
+}

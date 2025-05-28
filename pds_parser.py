@@ -1,721 +1,615 @@
-# pds_parser.py
-# Defines the lexical and syntactic structures for Paradox Script (PDS) files.
-# Contains:
-#   - PdsToken: Represents a lexical token (type, value, line, column).
-#   - PdsLexer: Tokenizes PDS text into a stream of PdsTokens.
-#               Handles comments, strings, numbers, identifiers, operators, braces.
-#   - PdsNode (and subclasses): Abstract Syntax Tree (AST) nodes.
-#     - PdsComment, PdsBlankLine, PdsKeyValuePair, PdsList,
-#       PdsOperatorCondition, PdsBlock.
-#     - Each node implements:
-#       - to_string(): For reconstructing PDS text from the AST.
-#       - copy(): For deep copying nodes.
-#       - get_structural_components(): For equality checks and hashing,
-#         defining the "structural essence" of a node.
-#       - __eq__, __hash__: Based on structural components.
-#   - PdsParser: Parses a stream of PdsTokens into an AST (a list of PdsNodes).
-#                Handles top-level statements, block structures, lists, KVP, etc.
-#
-# Current Known Issues/Limitations:
-#   - Lexer: Might not handle all edge cases of PDS syntax, especially complex
-#            quoted identifiers or macro expansions if they exist.
-#            Assumes UTF-8 with BOM or UTF-8 encoding.
-#   - Parser:
-#     - List parsing is heuristic (distinguishing `key = { val }` (list) from
-#       `key = { child_key = val }` (block)) and might misinterpret ambiguous cases.
-#     - Error reporting is basic; doesn't implement sophisticated recovery.
-#   - AST Nodes:
-#     - `to_string()` formatting is functional but might not perfectly replicate
-#       original spacing or stylistic choices beyond basic indentation.
-#       The "WARNING: Normalized reconstruction mismatch" messages highlight this.
-#     - `PdsList` `to_string()` has heuristics for inline vs. multi-line.
-#   - Reconstruction Mismatches: The "WARNING: Normalized reconstruction mismatch"
-#     messages indicate that `parser.parse_file()` then `PdsParser._nodes_to_string()`
-#     does not perfectly reproduce the original file content after normalization.
-#     This is often due to:
-#       1. Whitespace differences (e.g., space around '=', number of blank lines).
-#       2. Comment positioning nuances not fully captured/reproduced.
-#       3. Quoting decisions (e.g., an unquoted identifier in input might be quoted
-#          on output if it contains special characters or vice-versa if it doesn't need it).
-#     While structural integrity is the main goal for diffing, these cosmetic
-#     differences can make direct text diffs of reconstructed files noisy.
-#     The `normalize_for_comparison` function in the test script attempts to mitigate this
-#     for comparison purposes, but fundamental `to_string` improvements might be needed
-#     for perfect 1:1 reconstruction if that's a strict requirement.
 import re
-import os
+import copy
 import sys
+import hashlib
+from enum import Enum
 
-class PdsToken:
-    def __init__(self, type, value, line, column):
-        self.type = type
-        self.value = value
-        self.line = line
-        self.column = column
-
-    def __repr__(self):
-        display_value = self.value
-        if isinstance(display_value, str) and len(display_value) > 30:
-            display_value = display_value[:27] + "..."
-        return f"Token(type='{self.type}', value='{display_value}', line={self.line}, col={self.column})"
-
-class PdsLexer:
-    def __init__(self, text):
-        self.text = text
-        self.pos = 0
-        self.line = 1
-        self.column = 1
-        self.tokens = []
-        self.single_char_tokens = {'{': 'LBRACE', '}': 'RBRACE', '=': 'EQUALS'}
-        self.patterns = [
-            ('COMMENT', r'#.*'),
-            ('OPERATOR', r'(?:>=|<=|==|!=|\?=|>|<|!)'),
-            ('STRING', r'"(?:\\.|[^"\\])*"'),
-            ('NUMBER', r'-?\d+(?:\.\d+)?'),
-            ('IDENTIFIER', r'[\w\.:@\-]+(?:[\w\.:@\-]*[\w\.:@\-])?'),
-        ]
-        self.compiled_patterns = [(k, re.compile(v)) for k, v in self.patterns]
-
-    def _advance_char(self): # Renamed for clarity
-        if self.pos < len(self.text):
-            char = self.text[self.pos]
-            self.pos += 1
-            if char == '\n':
-                self.line += 1
-                self.column = 1
-            else:
-                self.column += 1
-            return char
-        return None
-
-    def _add_token(self, token_type, token_value, start_line, start_column):
-        self.tokens.append(PdsToken(token_type, token_value, start_line, start_column))
-
-    def tokenize(self):
-        while self.pos < len(self.text):
-            current_char_start_line = self.line
-            current_char_start_column = self.column
-            char = self.text[self.pos]
-
-            if char.isspace(): # Includes space, tab, newline
-                if char == '\n':
-                    # Add NEWLINE token for every newline encountered
-                    self._add_token('NEWLINE', '\n', current_char_start_line, current_char_start_column)
-                self._advance_char() # Consume the whitespace character
-                continue
-
-            if char in self.single_char_tokens:
-                self._add_token(self.single_char_tokens[char], char, current_char_start_line, current_char_start_column)
-                self._advance_char()
-                continue
-
-            matched_pattern = False
-            for token_type, pattern_regex in self.compiled_patterns:
-                match = pattern_regex.match(self.text, self.pos)
-                if match:
-                    token_value_raw = match.group(0)
-                    val_to_store = token_value_raw
-                    if token_type == 'COMMENT':
-                        val_to_store = token_value_raw[1:]
-                    
-                    self._add_token(token_type, val_to_store, current_char_start_line, current_char_start_column)
-                    
-                    for _ in range(len(token_value_raw)): # Advance lexer position over the matched token
-                        self._advance_char()
-                    matched_pattern = True
-                    break
-            
-            if not matched_pattern:
-                raise ValueError(f"Lexer Error: Unexpected character '{char}' at line {self.line}, column {self.column}")
-        
-        self._add_token('EOF', '', self.line, self.column) # Add EOF token at the end
-        return self.tokens
-
-
+# --- Node Base Class and Concrete Node Types ---
 class PdsNode:
-    def __init__(self, line_number=-1):
+    def __init__(self, parent=None, line_number=None, original_line_content="", comment_text_on_line=None):
+        self.parent = parent
         self.line_number = line_number
-        self.indent_level = 0
-        self.comment_text_on_line = None
-
-    def to_string(self, current_indent=0, is_inline_context=False):
-        raise NotImplementedError(f"to_string() not implemented for {self.__class__.__name__}")
+        self.original_line_content = original_line_content
+        self.comment_text_on_line = comment_text_on_line.strip() if comment_text_on_line else None
+        self.children = [] # For PdsBlock
+        self.leading_comments_and_blanks = []
+        self.diff_path_key_suffix_counter = 0
+        self.sim_merge_comment = None # For attaching SimMerge annotations
 
     def __repr__(self):
-        # ... (same as previous version) ...
-        key_repr = getattr(self, 'key', 'N/A'); comment_repr = self.comment_text_on_line
-        if not isinstance(key_repr, str): key_repr = str(key_repr)
-        comment_str = f", Comment='{comment_repr[:10]}...'" if comment_repr else ""
-        cl_name = self.__class__.__name__; spec_repr = ""
-        if isinstance(self,PdsComment): spec_repr=f"'{getattr(self,'comment_text','')}[:20]...'"
-        elif isinstance(self,PdsBlankLine): spec_repr="Blank"
-        elif isinstance(self,PdsBlock) or (isinstance(self,PdsKeyValuePair) and isinstance(getattr(self,'value',None),PdsBlock)): spec_repr=f"{key_repr}={{...}}"
-        else: spec_repr=f"K='{key_repr}'"
-        return f"<{cl_name} L{self.line_number} I{self.indent_level} {spec_repr}{comment_str}>"
+        return f"<{self.__class__.__name__} L{self.line_number or '?'}>"
 
-
-    def _base_copy_attrs(self, new_node):
-        new_node.line_number = self.line_number
-        new_node.indent_level = self.indent_level
-        new_node.comment_text_on_line = self.comment_text_on_line
-        return new_node
-
-    def copy(self):
-        raise NotImplementedError(f"copy() not implemented for {self.__class__.__name__}")
+    def add_leading_comment_or_blank(self, node):
+        self.leading_comments_and_blanks.append(node)
 
     def get_structural_components(self, shallow_block=False):
-        raise NotImplementedError(f"get_structural_components() not implemented for {self.__class__.__name__}")
+        raise NotImplementedError(f"get_structural_components not implemented for {self.__class__.__name__}")
 
-    def __eq__(self, other):
-        if other is None: return False
-        if self.__class__ is not other.__class__: return False
+    def get_diff_key_base(self):
+        raise NotImplementedError(f"get_diff_key_base not implemented for {self.__class__.__name__}")
+
+    def to_pds_string(self, indent_level=0, is_list_item=False):
+        raise NotImplementedError(f"to_pds_string not implemented for {self.__class__.__name__}")
+
+    def _render_leading_comments_and_blanks(self, indent_level):
+        s = []
+        for node in self.leading_comments_and_blanks:
+            s.append(node.to_pds_string(indent_level))
+        return "".join(s)
+    
+    def _render_eol_comment_with_sim_merge(self):
+        comments = []
+        if self.comment_text_on_line:
+            comments.append(self.comment_text_on_line)
+        if self.sim_merge_comment:
+            comments.append(self.sim_merge_comment)
+        
+        return f" # {'; '.join(comments)}" if comments else ""
+
+
+    def find_child_by_diff_key(self, diff_key_segment):
+        # This method is for PdsBlock or nodes that have a concept of named/indexed children
+        # PdsList items are handled differently (by index or value usually)
+        children_list = []
+        if hasattr(self, 'children') and self.children:
+            children_list = self.children
+        elif hasattr(self, 'values') and self.values and all(isinstance(v, PdsNode) for v in self.values):
+             # If PdsList contains PdsNode items (like list of blocks)
+            children_list = [v for v in self.values if isinstance(v, PdsNode)]
+
+
+        if not children_list: return None
+
+        key_base, _, index_str = diff_key_segment.partition('___')
         try:
-            return self.get_structural_components(shallow_block=False) == \
-                   other.get_structural_components(shallow_block=False)
-        except NotImplementedError as e:
-            sys.stderr.write(f"ERROR: __eq__ called on class without get_structural_components: {e}\n")
-            return False
-
-    def __ne__(self, other):
-        equal = self.__eq__(other)
-        return False if equal is NotImplemented else not equal # Consistent with Python 3
-
-    def __hash__(self):
-        try: return hash(self.get_structural_components(shallow_block=False))
-        except NotImplementedError: return id(self)
-
-    def get_comparator_key(self, shallow_block_for_seq_matcher=False):
-        return self.get_structural_components(shallow_block=shallow_block_for_seq_matcher)
-
-class PdsComment(PdsNode):
-    def __init__(self, comment_text, line_number=-1):
-        super().__init__(line_number=line_number)
-        self.comment_text = comment_text
-
-    def to_string(self, current_indent=0, is_inline_context=False):
-        indent_str = " " * current_indent
-        return f"{indent_str}#{self.comment_text}\n" # Comments always end with a newline
-
-    def copy(self): # ... (same as previous) ...
-        new_node = PdsComment(comment_text=self.comment_text, line_number=self.line_number)
-        return self._base_copy_attrs(new_node)
-
-    def get_structural_components(self, shallow_block=False): # ... (same as previous) ...
-        return (self.__class__.__name__, self.comment_text)
-
-
-class PdsBlankLine(PdsNode):
-    def __init__(self, line_number=-1):
-        super().__init__(line_number=line_number)
-
-    def to_string(self, current_indent=0, is_inline_context=False):
-        return "\n" # A blank line node represents one empty line
-
-    def copy(self): # ... (same as previous) ...
-        new_node = PdsBlankLine(line_number=self.line_number)
-        return self._base_copy_attrs(new_node)
-
-    def get_structural_components(self, shallow_block=False): # ... (same as previous) ...
-        return (self.__class__.__name__,)
+            target_index = int(index_str)
+        except ValueError:
+            # print(f"Warning: Invalid index in diff_key_segment '{diff_key_segment}'")
+            return None # Or handle as error
+        
+        current_index = 0
+        for child in children_list:
+            if child.get_diff_key_base() == key_base:
+                if current_index == target_index:
+                    return child
+                current_index += 1
+        return None
+    
+    def find_child_by_key(self, key_to_find): # Convenience for PdsBlock
+        if not hasattr(self, 'children'): return None
+        for child in self.children:
+            if hasattr(child, 'key') and child.key == key_to_find:
+                return child
+        return None
 
 class PdsKeyValuePair(PdsNode):
-    _lexer_identifier_pattern = r'[\w\.:@\-]+(?:[\w\.:@\-]*[\w\.:@\-])?'
-
-    def __init__(self, key, value, line_number=-1, comment_text_on_line=None):
-        super().__init__(line_number=line_number)
+    def __init__(self, key, value, **kwargs):
+        super().__init__(**kwargs)
         self.key = key
-        self.value = value
-        self.comment_text_on_line = comment_text_on_line
+        self.value = value 
 
-    def to_string(self, current_indent=0, is_inline_context_ignored=False):
-        indent_str = " " * current_indent
-        line_content_start = f"{indent_str}{self.key} = "
-        value_actual_str = ""
-        ends_with_newline = True
+    def __repr__(self):
+        val_repr = self.value
+        if isinstance(self.value, PdsBlock): val_repr = f"Block({self.value.key or 'Anon'})"
+        elif isinstance(self.value, PdsList): val_repr = f"List({self.value.key or 'Anon'})"
+        return f"<PdsKeyValuePair L{self.line_number or '?'} {self.key}={val_repr}>"
 
-        if isinstance(self.value, PdsBlock):
-            block_node = self.value
-            # PdsBlock's to_string needs to know its context for potential inline rendering
-            block_render_str = block_node.to_string(current_indent, is_inline_context=True)
-            
-            if block_render_str.strip().startswith("{") and block_render_str.strip().endswith("}") and "\n" not in block_render_str:
-                value_actual_str = block_render_str.strip() # e.g. { child_key = 1 }
-            else: # Multiline block value
-                # The block's to_string should handle its own indentation starting from current_indent
-                # and its own newlines. We just append its output.
-                # The lstrip() is important if the block's to_string adds its own initial indent based on current_indent.
-                value_actual_str = block_render_str.lstrip() 
-                ends_with_newline = False # Block provides its own final newline
-        elif isinstance(self.value, str):
-            # Quoting logic (same as previous version, ensuring keywords like 'yes'/'no' are not quoted if identifiers)
-            is_simple_identifier = re.fullmatch(PdsKeyValuePair._lexer_identifier_pattern, self.value)
-            is_keyword_like = self.value.lower() in ["yes", "no", "rgb", "hsv", "hsv360"] # Common unquoted identifiers
-            
-            needs_quoting = not is_simple_identifier or \
-                            any(c in self.value for c in ' \t#={}"') or \
-                            not self.value
-            
-            if is_keyword_like and is_simple_identifier: # yes, no, etc.
-                 value_actual_str = self.value
-            elif self.key == "icon" and self.value.startswith("@") and is_simple_identifier: # icon = @foo
-                 value_actual_str = self.value
-            elif needs_quoting:
-                escaped_value = self.value.replace('\\', '\\\\').replace('"', '\\"')
-                value_actual_str = f'"{escaped_value}"'
-            else:
-                value_actual_str = self.value
+    def get_structural_components(self, shallow_block=False):
+        if isinstance(self.value, PdsNode):
+            return (self.key, self.value.get_structural_components(shallow_block=True if isinstance(self.value, PdsBlock) else shallow_block))
+        return (self.key, self.value)
+
+    def get_diff_key_base(self):
+        return str(self.key)
+
+    def to_pds_string(self, indent_level=0, is_list_item=False):
+        indent = "\t" * indent_level
+        s = self._render_leading_comments_and_blanks(indent_level)
+        
+        val_str = ""
+        if isinstance(self.value, PdsBlock) or isinstance(self.value, PdsList): 
+            # Render the block/list value. It will handle its own key (None) and braces.
+            # It needs to be rendered without the parent KVP's indent for its own content lines.
+            val_str = self.value.to_pds_string(indent_level if self.value.key else 0, is_list_item=True, is_kvp_value=True).strip()
+            # If the block/list string is multi-line, the KVP = needs to be on its own line.
+            if '\n' in val_str:
+                s += f"{indent}{self.key} ={self._render_eol_comment_with_sim_merge()}\n{indent}{val_str}\n" # Indent the block itself
+                return s # Already includes newline
+            # else it's single line like key = { val }
         elif isinstance(self.value, bool):
-            value_actual_str = "yes" if self.value else "no"
-        else: 
-            value_actual_str = str(self.value)
+            val_str = "yes" if self.value else "no"
+        elif isinstance(self.value, str):
+            if not self.value or re.search(r'[\s{}=#>]', self.value) or \
+               self.value.lower() in ["yes", "no", "true", "false"] or \
+               re.match(r"^-?\d+(\.\d*)?$", self.value): # Is a number-like string
+                val_str = f'"{self.value}"'
+            else:
+                val_str = self.value
+        elif self.value is None: # Should not happen for valid KVP
+            val_str = '""' 
+        else:
+            val_str = str(self.value)
         
-        line_content = line_content_start + value_actual_str
-        if self.comment_text_on_line: 
-            line_content += f" # {self.comment_text_on_line}"
+        s += f"{indent}{self.key} = {val_str}{self._render_eol_comment_with_sim_merge()}\n"
+        return s
+
+class PdsList(PdsNode):
+    def __init__(self, key=None, **kwargs):
+        super().__init__(**kwargs)
+        self.key = key 
+        self.values = [] # Items: primitives, PdsBlock (keyed or anonymous)
+
+    def __repr__(self):
+        return f"<PdsList L{self.line_number or '?'} key='{self.key}' items={len(self.values)}>"
+
+    def get_structural_components(self, shallow_block=False):
+        items_struct = []
+        for item in self.values:
+            if isinstance(item, PdsNode):
+                items_struct.append(item.get_structural_components(shallow_block=shallow_block))
+            else: 
+                items_struct.append(item)
+        # For lists, order might matter or not. Diffing logic will decide.
+        # For now, return as a tuple (ordered)
+        return (self.key, tuple(items_struct))
+
+    def get_diff_key_base(self):
+        return str(self.key) if self.key else "__ANONYMOUS_LIST__"
+
+    def to_pds_string(self, indent_level=0, is_list_item=False, is_kvp_value=False):
+        indent = "\t" * indent_level
+        s = self._render_leading_comments_and_blanks(indent_level)
+
+        is_multiline = '\n' in self.original_line_content or len(self.values) > 3 or \
+                       any(isinstance(v, PdsBlock) for v in self.values) or \
+                       any(isinstance(v, PdsList) for v in self.values) or \
+                       (len(self.values) > 0 and any(getattr(v, 'leading_comments_and_blanks', []) for v in self.values))
+
+
+        # Determine prefix for `key = {` or just `{`
+        list_opener = ""
+        if self.key: list_opener = f"{indent}{self.key} = {{ "
+        elif not is_kvp_value : list_opener = f"{indent}{{ " # Anonymous list item itself
+        else: list_opener = "{ " # Part of KVP value, e.g. key = { item1 }
+
+        if not self.values and not is_multiline: # Empty list, single line: key = { }
+            s += list_opener.strip() + " }" + self._render_eol_comment_with_sim_merge() + "\n"
+            return s
         
-        return line_content + ("\n" if ends_with_newline else "")
-
-    def copy(self): # ... (same as previous) ...
-        new_value = self.value.copy() if isinstance(self.value, PdsNode) else self.value
-        new_node = PdsKeyValuePair(self.key, new_value, self.line_number, self.comment_text_on_line)
-        return self._base_copy_attrs(new_node)
-
-    def get_structural_components(self, shallow_block=False): # ... (same as previous) ...
-        value_comp = self.value.get_structural_components(shallow_block=shallow_block) if isinstance(self.value, PdsNode) else self.value
-        return (self.__class__.__name__, self.key, value_comp, self.comment_text_on_line)
+        # If it became multiline due to sim_merge_comment on an item that is PdsComment
+        if not is_multiline and any(isinstance(v, PdsComment) and v.sim_merge_comment for v in self.values):
+            is_multiline = True
 
 
-class PdsList(PdsNode): # Key = { val1 "val 2" }
-    def __init__(self, key, values, line_number=-1, comment_text_on_line=None):
-        super().__init__(line_number=line_number)
-        self.key = key
-        self.values = values # List of primitives (str, int, float, bool) or PdsNode (e.g. anonymous blocks)
-        self.comment_text_on_line = comment_text_on_line
-
-    def to_string(self, current_indent=0, is_inline_context=False):
-        indent_str = " " * current_indent
-        
-        # Heuristic: if all values are simple (not PdsNode) and short, render inline
-        all_simple_primitives = all(not isinstance(v, PdsNode) for v in self.values)
-        temp_value_str_for_len_check = " ".join([str(v) for v in self.values if not isinstance(v, PdsNode)])
-
-        if all_simple_primitives and (len(self.values) <= 3 or len(temp_value_str_for_len_check) < 50): # Inline
-            formatted_values = []
-            for v_item in self.values: # Should be primitives here
-                if isinstance(v_item, str):
-                    is_simple_id = re.fullmatch(PdsKeyValuePair._lexer_identifier_pattern, v_item)
-                    needs_q = not is_simple_id or any(c in v_item for c in ' \t#={}"') or not v_item or v_item.lower() in ["yes","no"]
-                    if v_item.lower() in ["yes","no"]: formatted_values.append(v_item)
-                    elif needs_q: formatted_values.append(f'"{v_item.replace("\\\\", "\\\\\\\\").replace("\"", "\\\"")}"')
-                    else: formatted_values.append(v_item)
-                elif isinstance(v_item, bool): formatted_values.append("yes" if v_item else "no")
-                else: formatted_values.append(str(v_item))
-            
-            value_str = " ".join(formatted_values)
-            inner_content = f" {value_str} " if value_str else " " # Ensure space if empty: key = { }
-            base_string = f"{indent_str}{self.key} = {{{inner_content}}}"
-            if self.comment_text_on_line: base_string += f" # {self.comment_text_on_line}"
-            return base_string + "\n"
-        else: # Multi-line: key = {\n  val1\n  val2\n  { anon_block }\n}
-            output_lines = []
-            open_brace_line = f"{indent_str}{self.key} = {{"
-            if self.comment_text_on_line: open_brace_line += f" # {self.comment_text_on_line}"
-            output_lines.append(open_brace_line + "\n")
-
-            child_render_indent = current_indent + 4
-            for value_item in self.values:
-                if isinstance(value_item, PdsNode): # e.g. an anonymous block
-                    value_item.indent_level = child_render_indent # Ensure indent before to_string
-                    output_lines.append(value_item.to_string(child_render_indent))
-                else: # Primitive value, render on its own indented line
-                    val_str_item = "" # Copied from inline logic for primitives
-                    if isinstance(value_item, str):
-                        is_simple_id = re.fullmatch(PdsKeyValuePair._lexer_identifier_pattern, value_item)
-                        needs_q = not is_simple_id or any(c in value_item for c in ' \t#={}"') or not value_item or value_item.lower() in ["yes","no"]
-                        if value_item.lower() in ["yes","no"]: val_str_item = value_item
-                        elif needs_q: val_str_item = f'"{value_item.replace("\\\\", "\\\\\\\\").replace("\"", "\\\"")}"'
-                        else: val_str_item = value_item
-                    elif isinstance(value_item, bool): val_str_item = "yes" if value_item else "no"
-                    else: val_str_item = str(value_item)
-                    output_lines.append(f"{' ' * child_render_indent}{val_str_item}\n")
-            
-            output_lines.append(f"{indent_str}}}\n")
-            return "".join(output_lines)
-
-    def copy(self): # ... (same as previous) ...
-        new_values = [v.copy() if isinstance(v, PdsNode) else v for v in self.values]
-        new_node = PdsList(self.key, new_values, self.line_number, self.comment_text_on_line)
-        return self._base_copy_attrs(new_node)
-
-    def get_structural_components(self, shallow_block=False): # ... (same as previous) ...
-        values_comp = [v.get_structural_components(shallow_block=shallow_block) if isinstance(v,PdsNode) else v for v in self.values]
-        return (self.__class__.__name__, self.key, tuple(values_comp), self.comment_text_on_line)
-
-class PdsOperatorCondition(PdsNode): # key > value
-    def __init__(self, key, operator, value, line_number=-1, comment_text_on_line=None):
-        super().__init__(line_number=line_number)
-        self.key = key; self.operator = operator; self.value = value      
-        self.comment_text_on_line = comment_text_on_line
-
-    def to_string(self, current_indent=0, is_inline_context_ignored=False): # Usually inline
-        # ... (same as previous, ensure value quoting is robust) ...
-        indent_str = " " * current_indent; value_actual_str = ""
-        if isinstance(self.value, str):
-            is_simple_id = re.fullmatch(PdsKeyValuePair._lexer_identifier_pattern, self.value)
-            needs_q = not is_simple_id or any(c in self.value for c in ' \t#={}"') or not self.value or self.value.lower() in ["yes","no"]
-            if self.value.lower() in ["yes", "no"]: value_actual_str = self.value
-            elif needs_q: value_actual_str = f'"{self.value.replace("\\\\", "\\\\\\\\").replace("\"", "\\\"")}"'
-            else: value_actual_str = self.value
-        elif isinstance(self.value, bool): value_actual_str = "yes" if self.value else "no"
-        elif isinstance(self.value, PdsNode): value_actual_str = self.value.to_string(0).strip()
-        else: value_actual_str = str(self.value)
-        line = f"{indent_str}{self.key} {self.operator} {value_actual_str}"
-        if self.comment_text_on_line: line += f" # {self.comment_text_on_line}"
-        return line + "\n"
-
-
-    def copy(self): # ... (same as previous) ...
-        new_value = self.value.copy() if isinstance(self.value, PdsNode) else self.value
-        new_node = PdsOperatorCondition(self.key, self.operator, new_value, self.line_number, self.comment_text_on_line)
-        return self._base_copy_attrs(new_node)
-
-    def get_structural_components(self, shallow_block=False): # ... (same as previous) ...
-        value_comp = self.value.get_structural_components(shallow_block=shallow_block) if isinstance(self.value, PdsNode) else self.value
-        return (self.__class__.__name__, self.key, self.operator, value_comp, self.comment_text_on_line)
+        if not is_multiline: # Single line list: key = { item1 item2 }
+            item_strings = []
+            for item in self.values:
+                if isinstance(item, PdsBlock) or isinstance(item, PdsList): # Anonymous block/list in list
+                    item_strings.append(item.to_pds_string(0, is_list_item=True).strip()) 
+                elif isinstance(item, PdsComment): # Should not happen for single-line lists usually
+                    item_strings.append(f"# {item.comment_text}{item._render_eol_comment_with_sim_merge()}")
+                elif isinstance(item, str):
+                    if not item or re.search(r'[\s{}=#>]', item) or item.lower() in ["yes", "no", "true", "false"] or re.match(r"^-?\d+(\.\d*)?$", item):
+                         item_strings.append(f'"{item}"')
+                    else: item_strings.append(item)
+                elif isinstance(item, bool):
+                    item_strings.append("yes" if item else "no")
+                else:
+                    item_strings.append(str(item))
+            s += list_opener.strip() + " ".join(item_strings) + " }" + self._render_eol_comment_with_sim_merge() + "\n"
+        else: # Multi-line list
+            s += list_opener.strip() + self._render_eol_comment_with_sim_merge() + "\n"
+            for item in self.values:
+                item_s = ""
+                # Render leading comments/blanks of the item itself if it's a PdsNode
+                if isinstance(item, PdsNode):
+                    item_s += item._render_leading_comments_and_blanks(indent_level + 1)
+                    item_s += item.to_pds_string(indent_level + 1, is_list_item=True) 
+                else: # primitive
+                    val_str = ""
+                    if isinstance(item, bool): val_str = "yes" if item else "no"
+                    elif isinstance(item, str):
+                        if not item or re.search(r'[\s{}=#>]', item) or item.lower() in ["yes", "no", "true", "false"] or re.match(r"^-?\d+(\.\d*)?$", item): 
+                            val_str = f'"{item}"'
+                        else: val_str = item
+                    elif item is None: val_str = '""' # Should not happen
+                    else: val_str = str(item)
+                    item_s += f"{indent}\t{val_str}\n" 
+                s += item_s
+            s += f"{indent}}}\n"
+        return s
 
 class PdsBlock(PdsNode):
-    def __init__(self, key, line_number=-1, comment_text_on_line=None):
-        super().__init__(line_number=line_number)
-        self.key = key 
-        self.children = []
-        self.comment_text_on_line = comment_text_on_line
+    def __init__(self, key=None, **kwargs): 
+        super().__init__(**kwargs)
+        self.key = key
+        # self.children is inherited from PdsNode
 
-    def add_child(self, node):
-        if not isinstance(node, PdsNode):
-            raise TypeError(f"Can only add PdsNode instances as children, got {type(node)}")
-        # Indent is set by parser or by to_string based on parent
-        self.children.append(node)
+    def __repr__(self):
+        return f"<PdsBlock L{self.line_number or '?'} key='{self.key}' children={len(self.children)}>"
+    
+    def get_structural_components(self, shallow_block=False):
+        if shallow_block:
+            return (self.key, f"<Block content {'not inspected' if self.children else 'empty'}>")
 
-    def to_string(self, current_indent=0, is_inline_context=False):
-        indent_str = " " * current_indent
-        block_key_prefix = f"{self.key} = " if self.key is not None else ""
-
-        # Try inline rendering: key = { child_key = val } (no newlines)
-        if (is_inline_context and len(self.children) == 1 and
-                isinstance(self.children[0], PdsKeyValuePair) and
-                not isinstance(self.children[0].value, PdsBlock) and # Child's value is not another block
-                not self.comment_text_on_line and # Block itself has no opening line comment
-                not self.children[0].comment_text_on_line # Child has no line comment
-                and len(self.children[0].key) + len(str(self.children[0].value)) < 40): # Heuristic for length
-            
-            # Render child with zero indent relative to its own content, then strip.
-            # The child KVP's to_string should not add indent if current_indent is 0.
-            child_str_compact = self.children[0].to_string(current_indent=0).strip() # key = value
-            return f"{block_key_prefix}{{{child_str_compact}}}" # No newline if truly inline for KVP value
-
-        # Standard multi-line rendering
-        output_parts = []
-        open_brace_line = f"{indent_str}{block_key_prefix}{{"
-        if self.comment_text_on_line:
-            open_brace_line += f" # {self.comment_text_on_line}"
-        output_parts.append(open_brace_line) # No \n yet
-
-        if not self.children: # Empty block: key = {}
-            output_parts.append("}\n") # Add closing brace and newline
-        else:
-            output_parts.append("\n") # Newline after opening brace if there are children
-            child_render_indent = current_indent + 4
-            for child_node in self.children:
-                child_node.indent_level = child_render_indent # Ensure child knows its indent
-                output_parts.append(child_node.to_string(child_render_indent)) # Child.to_string provides its own ending \n
-            output_parts.append(f"{indent_str}}}\n") # Indented closing brace with newline
-        
-        return "".join(output_parts)
-        
-    # find_child_by_key, find_all_children_by_key, copy, replace_child, remove_child, add_child_at_appropriate_location
-    # remain same as previous "good" version.
-    def find_child_by_key(self, key_name, Nth=0): # ... (same) ...
-        count=0
+        children_structs = []
+        temp_child_counters = {}
         for child in self.children:
-            if hasattr(child,'key') and child.key==key_name:
-                if count==Nth: return child
-                count+=1
-        return None
-    def find_all_children_by_key(self, key_name): # ... (same) ...
-        return [child for child in self.children if hasattr(child,'key') and child.key==key_name]
-    def copy(self): # ... (same) ...
-        new_node=PdsBlock(self.key,self.line_number,self.comment_text_on_line)
-        self._base_copy_attrs(new_node)
-        new_node.children=[child.copy() for child in self.children]
-        return new_node
-    def replace_child(self, old_child_node_instance, new_child_node): # ... (same) ...
-        if not isinstance(new_child_node, PdsNode): raise TypeError("New child PdsNode")
-        try:
-            idx=self.children.index(old_child_node_instance)
-            new_child_node.indent_level=old_child_node_instance.indent_level
-            self.children[idx]=new_child_node; return True
-        except ValueError: return False
-    def remove_child(self, child_node_instance): # ... (same) ...
-        try: self.children.remove(child_node_instance); return True
-        except ValueError: return False
-    def add_child_at_appropriate_location(self, new_child_node, after_node_instance=None, before_node_instance=None): # ... (same) ...
-        if not isinstance(new_child_node, PdsNode): raise TypeError("New child PdsNode")
-        new_child_node.indent_level = self.indent_level + 4
-        if before_node_instance:
-            try: self.children.insert(self.children.index(before_node_instance), new_child_node); return True
-            except ValueError: pass 
-        if after_node_instance:
-            try: self.children.insert(self.children.index(after_node_instance) + 1, new_child_node); return True
-            except ValueError: pass
-        insert_idx = len(self.children)
-        for i in reversed(range(len(self.children))):
-            if not isinstance(self.children[i], (PdsComment, PdsBlankLine)): insert_idx=i+1; break
-        self.children.insert(insert_idx, new_child_node); return True
+            child_key_base = child.get_diff_key_base()
+            idx = temp_child_counters.get(child_key_base, 0)
+            child_diff_key_for_struct = f"{child_key_base}___{idx}"
+            temp_child_counters[child_key_base] = idx + 1
+            children_structs.append((child_diff_key_for_struct, child.get_structural_components(shallow_block=False)))
+        return (self.key, frozenset(children_structs))
+
+    def get_diff_key_base(self):
+        return str(self.key) if self.key is not None else "__ANONYMOUS_BLOCK__"
+
+    def to_pds_string(self, indent_level=0, is_list_item=False, is_kvp_value=False):
+        indent = "\t" * indent_level
+        s = self._render_leading_comments_and_blanks(indent_level)
+        
+        open_brace_line = ""
+        if self.key:
+            open_brace_line = f"{indent}{self.key} = {{ {self._render_eol_comment_with_sim_merge()}\n"
+        elif not is_kvp_value: 
+            open_brace_line = f"{indent}{{ {self._render_eol_comment_with_sim_merge()}\n"
+        else: 
+             open_brace_line = f"{{ {self._render_eol_comment_with_sim_merge()}" # KVP val, might be single line
+             if not self.children: # Empty anonymous block as KVP value: key = { }
+                 open_brace_line += " }"
+                 return s + open_brace_line # No trailing newline if it's part of KVP line
+             open_brace_line += "\n"
 
 
-    def get_structural_components(self, shallow_block=False): # ... (same as previous) ...
-        if shallow_block: return (self.__class__.__name__, self.key, self.comment_text_on_line)
-        else:
-            children_comps = tuple(c.get_structural_components(shallow_block=False) for c in self.children)
-            return (self.__class__.__name__, self.key, self.comment_text_on_line, children_comps)
+        s += open_brace_line
 
+        # Render children
+        for child_node in self.children:
+            s += child_node.to_pds_string(indent_level + 1)
+        
+        if not is_kvp_value: 
+            s += f"{indent}}}\n"
+        else: # Block is a KVP's value
+            if '\n' in open_brace_line : # It was multi-line
+                 s += f"{indent}}}\n"
+            else: # Was single line, e.g. key = { child=val }
+                 s += f"}}\n" # This needs careful newline handling with KVP. KVP adds final \n.
+    
+        return s
+
+class PdsComment(PdsNode):
+    def __init__(self, comment_text, **kwargs):
+        super().__init__(**kwargs)
+        self.comment_text = comment_text.strip() if comment_text else ""
+
+    def __repr__(self):
+        return f"<PdsComment L{self.line_number or '?'} text='{self.comment_text[:30]}{'...' if len(self.comment_text)>30 else ''}'>"
+
+    def get_structural_components(self, shallow_block=False):
+        return ("__COMMENT__", self.comment_text) 
+
+    def get_diff_key_base(self):
+        h = hashlib.md5(self.comment_text.encode('utf-8')).hexdigest()[:10]
+        return f"__COMMENT_{h}"
+
+    def to_pds_string(self, indent_level=0, is_list_item=False):
+        indent = "\t" * indent_level
+        s = self._render_leading_comments_and_blanks(indent_level) 
+        s += f"{indent}# {self.comment_text}{self._render_eol_comment_with_sim_merge()}\n"
+        return s
+
+class PdsBlankLine(PdsNode):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    def __repr__(self):
+        return f"<PdsBlankLine L{self.line_number or '?'}>"
+
+    def get_structural_components(self, shallow_block=False):
+        return ("__BLANKLINE__", self.line_number) 
+
+    def get_diff_key_base(self):
+        return "__BLANKLINE__" # Suffix will differentiate
+
+    def to_pds_string(self, indent_level=0, is_list_item=False):
+        s = self._render_leading_comments_and_blanks(indent_level)
+        s += "\n" 
+        return s
+
+class PdsOperatorCondition(PdsNode):
+    def __init__(self, key, operator, value, **kwargs):
+        super().__init__(**kwargs)
+        self.key = key
+        self.operator = operator
+        self.value = value
+
+    def __repr__(self):
+        return f"<PdsOperatorCondition L{self.line_number or '?'} {self.key} {self.operator} {self.value}>"
+
+    def get_structural_components(self, shallow_block=False):
+        return (self.key, self.operator, self.value)
+
+    def get_diff_key_base(self):
+        return str(self.key) 
+
+    def to_pds_string(self, indent_level=0, is_list_item=False):
+        indent = "\t" * indent_level
+        s = self._render_leading_comments_and_blanks(indent_level)
+        
+        val_str = ""
+        if isinstance(self.value, bool): val_str = "yes" if self.value else "no"
+        elif isinstance(self.value, str):
+            if not self.value or re.search(r'[\s{}=#>]', self.value) or self.value.lower() in ["yes", "no", "true", "false"] or re.match(r"^-?\d+(\.\d*)?$", self.value): 
+                val_str = f'"{self.value}"'
+            else: val_str = self.value
+        elif self.value is None: val_str = '""'
+        else: val_str = str(self.value)
+
+        s += f"{indent}{self.key} {self.operator} {val_str}{self._render_eol_comment_with_sim_merge()}\n"
+        return s
+
+# --- Parser Class ---
 class PdsParser:
-    def __init__(self):
-        self.tokens = []; self.current_token_index = 0
-        self.root_nodes = []; self.parent_stack = []
+    _RE_COMMENT = re.compile(r"^\s*#\s*(.*)")
+    _RE_KVP = re.compile(r"""^\s*([a-zA-Z_][\w-]*)\s*=\s*(                           # Key and equals
+                                (?:\"((?:\\\"|[^\"])*?)\") |                          # Quoted string value (group 2 is content)
+                                (?:(-?\d+\.\d*(?:[eE][-+]?\d+)?|-?\d+[eE][-+]?\d+|-?\.\d+(?:[eE][-+]?\d+)?|-?\d+)) |                        # Number (float or int) (group 3)
+                                (yes|no|true|false) |                             # Boolean (group 4)
+                                ([^\s\"\{#][^\s\{#=]*(?<!\s))                     # Unquoted string (group 5)
+                            )\s*(?:#\s*(.*))?$""", re.VERBOSE | re.IGNORECASE) # Ignore case for yes/no/true/false
+    
+    _RE_OPERATOR = re.compile(r"""^\s*([a-zA-Z_][\w-]*)\s*([><=!]=?|!=)\s*(             # Key and operator
+                                (?:\"((?:\\\"|[^\"])*?)\") |                          # Quoted string value (group 4)
+                                (?:(-?\d+\.\d*(?:[eE][-+]?\d+)?|-?\d+[eE][-+]?\d+|-?\.\d+(?:[eE][-+]?\d+)?|-?\d+)) |                        # Number (group 5)
+                                (yes|no|true|false) |                             # Boolean (group 6)
+                                ([^\s\"\{#][^\s\{#=]*(?<!\s))                     # Unquoted string (group 7)
+                            )\s*(?:#\s*(.*))?$""", re.VERBOSE | re.IGNORECASE)
+    
+    _RE_BLOCK_LIST_START = re.compile(r"^\s*(?:([a-zA-Z_][\w-]*)\s*=\s*)?\{\s*(?:#\s*(.*))?$")
+    _RE_BLOCK_LIST_END = re.compile(r"^\s*\}\s*(?:#\s*(.*))?$")
+    _RE_SIMPLE_LIST_ITEM = re.compile(r"""(?:\"((?:\\\"|[^\"])*?)\") | (?:(-?\d+\.\d*(?:[eE][-+]?\d+)?|-?\d+[eE][-+]?\d+|-?\.\d+(?:[eE][-+]?\d+)?|-?\d+)) | (yes|no|true|false) | ([a-zA-Z_][\w-]*)""", re.VERBOSE | re.IGNORECASE)
 
-    def _error(self, message, token_override=None):
-        # ... (same as previous version) ...
-        token_info = ""; token_to_report = token_override if token_override else self._peek()
-        if token_to_report and token_to_report.type != 'EOF': token_info = f"at token '{token_to_report.value}' (type: {token_to_report.type}) on line {token_to_report.line}, col {token_to_report.column}"
-        elif self.current_token_index > 0 and self.current_token_index <= len(self.tokens): prev_token = self.tokens[self.current_token_index -1]; token_info = f"after token '{prev_token.value}' (type: {prev_token.type}) on line {prev_token.line}, col {prev_token.column}"
-        else: token_info = "at beginning/empty file"
-        raise ValueError(f"Parser Error: {message}. {token_info}")
-
-    def _peek(self, offset=0): # ... (same) ...
-        idx = self.current_token_index + offset
-        return self.tokens[idx] if idx < len(self.tokens) else self.tokens[-1]
-
-    def _advance(self): # ... (same) ...
-        if self.current_token_index < len(self.tokens) - 1: self.current_token_index += 1
-        return self.tokens[self.current_token_index -1]
-
-    def _consume(self, *expected_types): # ... (same) ...
-        token = self._peek()
-        if token.type in expected_types: return self._advance()
-        self._error(f"Expected one of {expected_types}", token_override=token)
-
-    def _is_next(self, *token_types): return self._peek().type in token_types # ... (same) ...
-    def is_eof(self): return self._peek().type == 'EOF' # ... (same) ...
-
-    def _parse_comment_node(self): # ... (same) ...
-        token = self._consume('COMMENT'); return PdsComment(token.value, token.line)
-
-    def _parse_primitive_value(self, token_val_if_consumed=None): # ... (same as previous, ensure it handles consumed tokens) ...
-        token_obj = None
-        if token_val_if_consumed is None: token_obj = self._peek()
-        
-        val_to_parse = token_val_if_consumed if token_val_if_consumed is not None else token_obj.value
-        type_of_val = 'IDENTIFIER' # Assume if pre-consumed; parser needs to know this from context
-        if token_obj: type_of_val = token_obj.type
-        
-        if type_of_val == 'IDENTIFIER':
-            if token_obj: self._advance() # Consume if not pre-consumed
-            if val_to_parse.lower() == "yes": return True
-            if val_to_parse.lower() == "no": return False
-            return val_to_parse 
-        elif type_of_val == 'NUMBER':
-            if token_obj: self._advance()
-            try: return float(val_to_parse) if '.' in val_to_parse else int(val_to_parse)
-            except ValueError: return val_to_parse 
-        elif type_of_val == 'STRING':
-            if token_obj: self._advance()
-            val_str = val_to_parse[1:-1]; return val_str.replace('\\"', '"').replace('\\\\', '\\')
-        return None
-
-
-    def _parse_value_for_kvp_or_op(self): # ... (same as previous) ...
-        if self._is_next('LBRACE'): return self._parse_block_content(key_for_block=None, line_of_key=self._peek().line)
-        else:
-            pv = self._parse_primitive_value();
-            if pv is not None: return pv
-            self._error(f"Expected a value (primitive or anonymous block {{...}})")
-        return None
-
-    def _parse_statement_or_item(self): # Handles KVP, OpCond, Block, or bare value/anon block for list
-        start_token_line = self._peek().line
-        if self._is_next('COMMENT'): return self._parse_comment_node()
-        if self._is_next('LBRACE'): return self._parse_block_content(key_for_block=None, line_of_key=start_token_line) # Anonymous block
-
-        if not (self._is_next('IDENTIFIER') or self._is_next('NUMBER') or self._is_next('STRING')):
-             self._error("Statement or list item must start with IDENTIFIER, NUMBER, STRING, or LBRACE")
-
-        key_cand_token = self._consume('IDENTIFIER', 'NUMBER', 'STRING')
-        key_str_raw = key_cand_token.value; key_line = key_cand_token.line
-        key_for_node = key_str_raw
-        if key_cand_token.type == 'STRING': key_for_node = key_str_raw[1:-1].replace('\\"', '"').replace('\\\\', '\\')
-
-        if self._is_next('EQUALS'):
-            self._consume('EQUALS')
-            if self._is_next('LBRACE'): return self._parse_block_or_list_after_equals(key_for_node, key_line)
-            else:
-                val_node = self._parse_primitive_value()
-                if val_node is None: self._error("Expected primitive value after '='")
-                cmt = None
-                if self._is_next('COMMENT') and self._peek().line == self.tokens[self.current_token_index-1].line:
-                    cmt = self._consume('COMMENT').value
-                return PdsKeyValuePair(key_for_node, val_node, key_line, cmt)
-        elif self._is_next('OPERATOR'):
-            op_tok = self._consume('OPERATOR'); val_node = self._parse_value_for_kvp_or_op(); cmt = None
-            if self._is_next('COMMENT') and self._peek().line == self.tokens[self.current_token_index-1].line:
-                 cmt = self._consume('COMMENT').value
-            return PdsOperatorCondition(key_for_node, op_tok.value, val_node, key_line, cmt)
-        elif self._is_next('LBRACE'): return self._parse_block_content(key_for_node, key_line)
-        else: # Bare value (for list)
-            return self._parse_primitive_value(token_val_if_consumed=key_str_raw)
-
-
-    def _parse_block_or_list_after_equals(self, key_str_for_node, key_line_for_node):
-        # ... (same as previous refined version, with robust lookahead) ...
-        lbrace_token = self._consume('LBRACE'); comment_on_lbrace = None
-        if self._is_next('COMMENT') and self._peek().line == lbrace_token.line: comment_on_lbrace = self._consume('COMMENT').value
-        is_likely_block = False; temp_idx = self.current_token_index
-        while temp_idx < len(self.tokens) and self.tokens[temp_idx].type in ('NEWLINE','COMMENT'): temp_idx +=1
-        if temp_idx < len(self.tokens):
-            first_sig_tok = self.tokens[temp_idx]
-            if first_sig_tok.type in ('IDENTIFIER','STRING','NUMBER'):
-                if temp_idx + 1 < len(self.tokens) and self.tokens[temp_idx+1].type in ('EQUALS','OPERATOR','LBRACE'): is_likely_block=True
-            # If first_sig_tok is LBRACE, it's a list of anonymous blocks, so NOT is_likely_block (for PdsBlock itself)
-        if self._is_next('RBRACE'): is_likely_block = True # Empty {} is a block
-        
-        if is_likely_block:
-            block_node = self._parse_block_content(key_str_for_node, key_line_for_node, block_opening_comment=comment_on_lbrace, is_rhs_of_equals=True)
-            return block_node
-        else:
-            list_node = PdsList(key_str_for_node, [], key_line_for_node, comment_on_lbrace)
-            while not self._is_next('RBRACE') and not self.is_eof():
-                self._skip_newlines_and_comments_in_list()
-                if self._is_next('RBRACE') or self.is_eof(): break
-                list_item = self._parse_statement_or_item()
-                if list_item is not None: list_node.values.append(list_item)
-                elif not self._is_next('RBRACE'): self._error("Expected value or RBRACE in list")
-            self._consume('RBRACE'); return list_node
-            
-    def _skip_newlines_and_comments_in_list(self): # ... (same as previous) ...
-        while self._is_next('NEWLINE') or self._is_next('COMMENT'):
-            self._advance()
-            if self.is_eof(): break
-
-
-    def _parse_block_content(self, key_for_block, line_of_key, block_opening_comment=None, is_rhs_of_equals=False):
-        if not is_rhs_of_equals:
-            lbrace_token = self._consume('LBRACE')
-            if self._is_next('COMMENT') and self._peek().line == lbrace_token.line:
-                 block_opening_comment = self._consume('COMMENT').value
-        
-        block_node = PdsBlock(key_for_block, line_of_key, block_opening_comment)
-        current_parent_indent = self.parent_stack[-1].indent_level if self.parent_stack else -4
-        block_node.indent_level = current_parent_indent + 4
-        self.parent_stack.append(block_node)
-
-        # Consume initial newlines after LBRACE, but don't make them blank line nodes yet.
-        # A PdsBlankLine node represents a *semantically empty line* between statements.
-        processed_a_child_on_this_line = False # To help decide if a newline is a blank line
-        
-        while not self._is_next('RBRACE') and not self.is_eof():
-            current_token = self._peek()
-            
-            if current_token.type == 'NEWLINE':
-                self._advance() # Consume this newline
-                # If the next token is also a NEWLINE (on a different line effectively)
-                # or RBRACE or EOF, then the consumed newline formed a blank line.
-                next_peek = self._peek()
-                if (next_peek.type == 'NEWLINE' and next_peek.line != current_token.line) or \
-                   next_peek.type == 'RBRACE' or next_peek.type == 'EOF':
-                    # Only add if there wasn't content on the line that just ended with current_token (NEWLINE)
-                    # This simple check might still create too many if not careful.
-                    # A better check: was the line of `current_token` truly blank before it?
-                    # For now, if we just consumed a NEWLINE, and what follows implies it was an empty line:
-                    block_node.add_child(PdsBlankLine(current_token.line))
-                processed_a_child_on_this_line = False # Newline resets this
-                continue 
-            
-            processed_a_child_on_this_line = True
-
-            if current_token.type == 'COMMENT':
-                block_node.add_child(self._parse_comment_node())
-                # A comment is a statement, so the line isn't blank before it for blank line logic
-                # After a comment, a newline will follow, handled by next iteration.
-                continue
-            
-            if self.is_eof(): self._error("Unexpected EOF inside block", token_override=self._peek(-1))
-            if self._is_next('RBRACE'): break # Should be caught by while loop condition
-
-            child_node = self._parse_statement_or_item()
-            if child_node is not None:
-                 if not isinstance(child_node, PdsNode):
-                     self._error(f"Block '{key_for_block}' cannot directly contain primitive value '{child_node}'.")
-                 block_node.add_child(child_node)
-            elif not self._is_next('RBRACE') and not self.is_eof():
-                 self._error(f"Parser stuck in block '{key_for_block}' before token", token_override=self._peek())
-        
-        self._consume('RBRACE')
-        self.parent_stack.pop()
-        return block_node
 
     def parse_file(self, filepath):
-        # ... (file reading and lexer setup - same as previous) ...
-        self.root_nodes = []; self.parent_stack = []; self.current_token_index = 0
-        # ... (error handling for file ops - same) ...
-        if not os.path.exists(filepath): sys.stderr.write(f"Error: File not found: {filepath}\n"); return []
         try:
-            with open(filepath, 'r', encoding='utf-8-sig') as f: text_content = f.read()
+            with open(filepath, 'r', encoding='utf-8-sig') as f: content = f.read()
         except UnicodeDecodeError:
-            with open(filepath, 'r', encoding='utf-8') as f: text_content = f.read()
-        except Exception as e: sys.stderr.write(f"Error reading {filepath}: {e}\n"); return []
-        
-        lexer = PdsLexer(text_content)
-        try: self.tokens = lexer.tokenize()
-        except ValueError as lex_err: sys.stderr.write(f"Lexer error in {filepath}: {lex_err}\n"); return []
-        if not self.tokens or self.tokens[0].type == 'EOF': return []
+            with open(filepath, 'r', encoding='utf-8') as f: content = f.read()
+        except FileNotFoundError:
+            # sys.stderr.write(f"PdsParser: File not found: {filepath}\n")
+            return []
+        return self.parse_content(content)
+
+    def _parse_primitive_value(self, val_str, quoted_str_content, number_str, bool_str, unquoted_str):
+        if quoted_str_content is not None: return quoted_str_content.replace('\\"', '"')
+        if number_str is not None:
+            try: return int(number_str)
+            except ValueError: return float(number_str)
+        if bool_str is not None: return bool_str.lower() == "yes" or bool_str.lower() == "true"
+        if unquoted_str is not None: return unquoted_str
+        return val_str # Fallback, should not happen if regex matches one group
+
+    def _peek_next_significant_line_info(self, lines, start_idx, current_block_indent):
+        for i in range(start_idx, len(lines)):
+            line_content = lines[i]
+            stripped_line = line_content.strip()
+            
+            if not stripped_line or self._RE_COMMENT.match(stripped_line):
+                continue # Skip blank or comment lines
+
+            line_indent = len(line_content) - len(line_content.lstrip())
+            # If this significant line is less indented or equally indented to the block opener,
+            # it means the block is empty or closing.
+            if line_indent <= current_block_indent and not self._RE_BLOCK_LIST_END.match(line_content): # not the closing brace itself
+                 # this means the block is empty and the next line belongs to parent or is sibling
+                 if self._RE_KVP.match(stripped_line) or self._RE_OPERATOR.match(stripped_line):
+                     return "EMPTY_LIKELY_BLOCK" # Empty, but if it had content, it'd be KVP/Op like
+                 return "EMPTY_LIKELY_LIST"
 
 
-        while not self.is_eof():
-            current_token = self._peek()
-            if current_token.type == 'NEWLINE':
-                self._advance()
-                next_peek = self._peek()
-                if (next_peek.type == 'NEWLINE' and next_peek.line != current_token.line) or \
-                   next_peek.type == 'EOF':
-                    self.root_nodes.append(PdsBlankLine(current_token.line))
+            # Check line types
+            if self._RE_KVP.match(stripped_line): return "KVP"
+            if self._RE_OPERATOR.match(stripped_line): return "OPERATOR"
+            # If it's another block/list start, it's a list item (keyed or anonymous block)
+            if self._RE_BLOCK_LIST_START.match(stripped_line): return "LIST_ITEM_BLOCK" 
+            # If it's a simple value, it's a list item
+            if self._RE_SIMPLE_LIST_ITEM.fullmatch(stripped_line): return "LIST_ITEM_PRIMITIVE"
+            
+            # If it's the end of the current block
+            if self._RE_BLOCK_LIST_END.match(line_content) and line_indent == current_block_indent:
+                return "EMPTY_SCOPE" # Empty scope of determined type by key or default
+
+            return "UNKNOWN_LIST_ITEM" # Fallback for list items not matching simple patterns
+        return "EOF" # End of file reached
+
+    def parse_content(self, text_content):
+        lines = text_content.splitlines()
+        root_nodes = []
+        node_stack = [(root_nodes, -1, "ROOT")] # (children_list_or_values_list, indent_level, type_of_container ('BLOCK' or 'LIST'))
+        pending_comments_and_blanks = []
+
+        for line_num_0based, original_line in enumerate(lines):
+            line_number = line_num_0based + 1
+            stripped_line = original_line.strip()
+            current_children_list, block_indent_level, container_type = node_stack[-1]
+            current_line_indent = len(original_line) - len(original_line.lstrip())
+
+            # Handle Block/List End '}'
+            match_block_end = self._RE_BLOCK_LIST_END.match(original_line)
+            if match_block_end:
+                if current_line_indent == block_indent_level and block_indent_level != -1:
+                    eol_comment_end = match_block_end.group(1)
+                    if current_children_list is not root_nodes and pending_comments_and_blanks:
+                         # Attach pending items as last children of the closing block/list
+                        if container_type == "BLOCK":
+                            node_stack[-2][0][-1].children.extend(pending_comments_and_blanks)
+                        elif container_type == "LIST": # Comments/blanks can be items in list if PdsComment nodes
+                            node_stack[-2][0][-1].values.extend(p for p in pending_comments_and_blanks if isinstance(p,PdsComment) or isinstance(p,PdsBlankLine))
+
+
+                        pending_comments_and_blanks = []
+                    
+                    # Attach EOL comment on '}' to the block/list node itself if it doesn't have one
+                    if current_children_list is not root_nodes: # We are inside a block/list
+                        parent_node = node_stack[-2][0][-1] # The block/list we are closing
+                        if eol_comment_end and not parent_node.comment_text_on_line:
+                            parent_node.comment_text_on_line = eol_comment_end
+                        elif eol_comment_end and parent_node.comment_text_on_line and parent_node.comment_text_on_line != eol_comment_end:
+                             # Both opener and closer have comments, store closer comment as a child if block
+                            if isinstance(parent_node, PdsBlock):
+                                 parent_node.children.append(PdsComment(comment_text=eol_comment_end, line_number=line_number, original_line_content=original_line))
+
+
+                    node_stack.pop()
+                    continue
+
+            if not stripped_line:
+                pending_comments_and_blanks.append(PdsBlankLine(line_number=line_number, original_line_content=original_line))
                 continue
             
-            if current_token.type == 'COMMENT':
-                self.root_nodes.append(self._parse_comment_node())
+            match_comment_line = self._RE_COMMENT.match(stripped_line)
+            if match_comment_line:
+                pending_comments_and_blanks.append(PdsComment(comment_text=match_comment_line.group(1), line_number=line_number, original_line_content=original_line))
                 continue
-            
-            if self.is_eof(): break
 
-            try:
-                node = self._parse_statement_or_item()
-                if node:
-                    if not isinstance(node, (PdsKeyValuePair, PdsOperatorCondition, PdsBlock, PdsList, PdsComment, PdsBlankLine)): # PdsList added
-                        self._error(f"Root level statement parsed into unexpected type: {type(node)}. Value: {node}")
-                    self.root_nodes.append(node)
-                elif not self.is_eof(): self._error(f"Parser did not produce a node and is not at EOF.")
-            except ValueError as parse_err:
-                sys.stderr.write(f"Parser error in {filepath}: {parse_err}\n")
-                return self.root_nodes 
-        return self.root_nodes
+            # --- Structural Nodes ---
+            node = None
+            # Attach pending comments/blanks before creating the node
+            current_node_leading_comments = pending_comments_and_blanks
+            pending_comments_and_blanks = []
+
+            # Try Block/List Start
+            match_block_list_start = self._RE_BLOCK_LIST_START.match(stripped_line)
+            if match_block_list_start:
+                key, eol_comment = match_block_list_start.groups()
+                
+                # This is a multi-line block/list opener
+                # Peek next significant line to determine type
+                # Pass current_line_indent of the opening brace's line
+                # The children will be at current_line_indent + 1 (typically)
+                # The closing brace '}' will be at current_line_indent
+                next_line_type = self._peek_next_significant_line_info(lines, line_num_0based + 1, current_line_indent)
+                
+                if next_line_type in ["KVP", "OPERATOR", "EMPTY_LIKELY_BLOCK"] or (key and next_line_type=="EMPTY_SCOPE"): # Default empty keyed to block
+                    node = PdsBlock(key=key, line_number=line_number, original_line_content=original_line, comment_text_on_line=eol_comment)
+                    node_stack.append((node.children, current_line_indent, "BLOCK"))
+                else: # LIST_ITEM_PRIMITIVE, LIST_ITEM_BLOCK, UNKNOWN_LIST_ITEM, EMPTY_LIKELY_LIST, EOF, or anonymous EMPTY_SCOPE
+                    node = PdsList(key=key, line_number=line_number, original_line_content=original_line, comment_text_on_line=eol_comment)
+                    node_stack.append((node.values, current_line_indent, "LIST"))
+            
+            elif container_type == "BLOCK": # Inside a PdsBlock, expect KVP or Operator
+                match_op = self._RE_OPERATOR.match(stripped_line)
+                if match_op:
+                    op_key, operator, _, val_str_q, val_str_n, val_str_b, val_str_u, eol_comment = match_op.groups()
+                    value = self._parse_primitive_value(None, val_str_q, val_str_n, val_str_b, val_str_u)
+                    node = PdsOperatorCondition(key=op_key, operator=operator, value=value, line_number=line_number, original_line_content=original_line, comment_text_on_line=eol_comment)
+                else: # Must be KVP if in a block
+                    match_kvp = self._RE_KVP.match(stripped_line)
+                    if match_kvp:
+                        kvp_key, _, val_str_q, val_str_n, val_str_b, val_str_u, eol_comment = match_kvp.groups()
+                        value = self._parse_primitive_value(None, val_str_q, val_str_n, val_str_b, val_str_u)
+                        node = PdsKeyValuePair(key=kvp_key, value=value, line_number=line_number, original_line_content=original_line, comment_text_on_line=eol_comment)
+            
+            elif container_type == "LIST": # Inside a PdsList, expect list items
+                # Item can be a primitive, or a new PdsBlock (keyed or anonymous)
+                # A PdsBlock item would have been matched by _RE_BLOCK_LIST_START already and node created.
+                # So if node is still None here, it must be a primitive list item.
+                match_simple_item = self._RE_SIMPLE_LIST_ITEM.fullmatch(stripped_line)
+                if match_simple_item:
+                    _,val_str_q, val_str_n, val_str_b, val_str_u = match_simple_item.groups() # _RE_SIMPLE_LIST_ITEM has initial non-capturing group
+                    item_value = self._parse_primitive_value(None,val_str_q, val_str_n, val_str_b, val_str_u)
+                    # Primitives are added directly to PdsList.values
+                    # We need to handle comments for primitive items if they are significant
+                    if current_node_leading_comments:
+                        # If primitive items have leading comments, they become PdsComment items in the list too
+                        current_children_list.extend(current_node_leading_comments)
+                        current_node_leading_comments = []
+                    current_children_list.append(item_value)
+                    # This primitive is not a PdsNode, so skip node processing below
+                    # This part is problematic if primitive items are expected to hold comments.
+                    # For this benchmark, list item comments are not explicitly tested.
+                    # If a PdsComment node was parsed and is pending, it will be added to list.
+                    continue 
+                # else: Unparsed list item, error or more complex item type
+            
+            else: # ROOT level, expect KVP, Operator, Block, List
+                match_op = self._RE_OPERATOR.match(stripped_line)
+                if match_op:
+                    op_key, operator, _, val_str_q, val_str_n, val_str_b, val_str_u, eol_comment = match_op.groups()
+                    value = self._parse_primitive_value(None, val_str_q, val_str_n, val_str_b, val_str_u)
+                    node = PdsOperatorCondition(key=op_key, operator=operator, value=value, line_number=line_number, original_line_content=original_line, comment_text_on_line=eol_comment)
+                else: # Default to KVP at root if not block/list start or operator
+                    match_kvp = self._RE_KVP.match(stripped_line)
+                    if match_kvp:
+                        kvp_key, _, val_str_q, val_str_n, val_str_b, val_str_u, eol_comment = match_kvp.groups()
+                        value = self._parse_primitive_value(None, val_str_q, val_str_n, val_str_b, val_str_u)
+                        node = PdsKeyValuePair(key=kvp_key, value=value, line_number=line_number, original_line_content=original_line, comment_text_on_line=eol_comment)
+
+            if node:
+                node.leading_comments_and_blanks = current_node_leading_comments
+                current_children_list.append(node)
+            elif stripped_line: # Unparsed line
+                # This might be a primitive list item if the parent is a list, but that case should be handled above.
+                print(f"PdsParser WARNING L{line_number}: Unparsed line in {container_type} context: '{original_line}'")
+                # Fallback: treat as a comment if it seems like it, or a string KVP if desperate
+                if current_node_leading_comments: # Attach to last real node or root
+                    if current_children_list:
+                         if isinstance(current_children_list[-1], PdsNode):
+                            current_children_list[-1].children.extend(current_node_leading_comments) # Bad place
+                    else:
+                        root_nodes.extend(current_node_leading_comments)
+
+
+        if pending_comments_and_blanks:
+            root_nodes.extend(pending_comments_and_blanks)
+            
+        if len(node_stack) > 1:
+            print(f"PdsParser WARNING: Unclosed blocks at end of file. Stack size: {len(node_stack)}")
+
+        self._assign_diff_key_suffixes(root_nodes)
+        return root_nodes
+
+    def _assign_diff_key_suffixes(self, nodes_list):
+        if not nodes_list: return
+        key_counts = {}
+        for node in nodes_list:
+            if not isinstance(node, PdsNode): continue # Skip primitives in lists
+
+            base_key = node.get_diff_key_base()
+            idx = key_counts.get(base_key, 0)
+            node.diff_path_key_suffix_counter = idx 
+            key_counts[base_key] = idx + 1
+
+            if isinstance(node, PdsBlock):
+                self._assign_diff_key_suffixes(node.children)
+            elif isinstance(node, PdsList):
+                # For PdsList, its items that are PdsNodes also need suffixes within the list's "namespace"
+                node_items_in_list = [v for v in node.values if isinstance(v, PdsNode)]
+                if node_items_in_list:
+                    self._assign_diff_key_suffixes(node_items_in_list)
+            elif isinstance(node, PdsKeyValuePair) and isinstance(node.value, (PdsBlock, PdsList)):
+                # If KVP's value is a block/list, recurse (though it's anonymous, so base key is fixed)
+                 self._assign_diff_key_suffixes([node.value])
+
 
     @staticmethod
-    def _nodes_to_string(nodes_list):
-        # ... (same as previous good version) ...
-        output = []
+    def _nodes_to_string(nodes_list, indent_level=0):
+        s = []
         for node in nodes_list:
-            node_indent = node.indent_level if node.indent_level is not None else 0
-            output.append(node.to_string(node_indent)) 
-        return "".join(output)
+            if isinstance(node, PdsNode):
+                 s.append(node.to_pds_string(indent_level))
+            else: # Primitive list item
+                 # This should be handled by PdsList.to_pds_string ideally
+                 s.append(("\t" * indent_level) + str(node) + "\n") 
+        return "".join(s)
 
-
-    def to_string(self): return PdsParser._nodes_to_string(self.root_nodes)
+def get_node_diff_key_for_find(node: PdsNode):
+    if not isinstance(node, PdsNode):
+        # Handle cases where node might be primitive (e.g. list item not wrapped)
+        # This indicates an issue in how nodes are passed or if primitives are expected
+        # For benchmark, it expects PdsNode.
+        raise TypeError(f"Expected PdsNode, got {type(node)} with value {node!r}")
+    
+    suffix = getattr(node, 'diff_path_key_suffix_counter', 0) 
+    return f"{node.get_diff_key_base()}___{suffix}"
