@@ -1,0 +1,157 @@
+# benchmark_test_mod.txt
+# Modded version for PDS Differ benchmark.
+
+# --- Section 1: Primitive Value Changes & Conflicts ---
+primitive_string = "mod_string_changed"
+primitive_number = 999.9
+primitive_bool = no
+primitive_float = 1.0 # Kept by Mod
+
+# --- Section 2: Additions, Deletions, Unchanged ---
+# This KVP will be deleted in Mod and Modified in New
+# (Absent)
+
+# This KVP will be added in Mod only
+add_mod_only = "mod_added" # Comment Mod Added
+
+# This KVP will be deleted in New only
+delete_new_only = 123 # Kept identical in Mod
+
+# This KVP will be modified in Mod, deleted in New
+modify_mod_delete_new = "modded_value" # Comment Mod Modified
+
+# This KVP will be deleted in Mod, kept in New
+# (Absent)
+
+# This KVP will be kept identical in both
+keep_identical = "unchanged" # Comment Identical
+
+# This comment will be modified in Mod and New
+# This is a modded comment
+
+# This blank line will be changed to a comment in Mod and New
+# # Mod replaced blank with comment
+
+# --- Section 3: Lists ---
+# Simple list, items modified/added/deleted in Mod and New
+simple_list_conflict = { item_a item_mod item_d item_added_mod } # Mod changed b, c, added d, added item_added_mod
+
+# Multi-line list, adds in Mod and New
+multi_line_list = {
+	item_1
+	item_mod_added # Mod adds here
+	item_2
+}
+
+# List with anonymous blocks - children changed
+list_with_anon_blocks = {
+	{ block_item_1 = mod_value_changed } # Mod changed value inside
+	{ block_item_2 = value_2 }
+	{ block_item_3_mod = mod_added } # Mod adds new anon block
+}
+
+# --- Section 4: Blocks ---
+# Simple block, children modified in Mod and New
+simple_block_conflict = { # Mod adds comment to block
+	# Mod adds child comment
+	child_kvp = mod_value_changed # Mod changes value
+	child_list = { list_item_x list_item_mod_y } # Mod changed y
+	mod_added_child = yes # Mod adds new child
+}
+
+# Nested blocks, changes at different levels
+parent_block = {
+	child_block_level1_mod = {
+		child_block_level2 = {
+			final_value = "modded" # Modified in Mod
+			mod_added_kvp = 1 # Mod adds child here
+		}
+		mod_added_at_level1 = "mod" # Mod adds KVP here
+	}
+	# Mod deletes child_block_level1_new below
+	# (Absent)
+	# Vanilla adds block here (Absent in Mod)
+}
+
+# Block modified by Mod (adds KVP), deleted by Vanilla
+modify_mod_delete_new_block = {
+	initial_child = 1
+	new_child_mod = yes # Mod adds new_child_mod here
+}
+
+# Block deleted by Mod, modified by Vanilla (adds KVP)
+# (Absent)
+
+# --- Section 5: Operator Conditions ---
+condition_example = { # Mod adds block comment
+	# Comment CondBlock Old # Mod adds to block comment line
+	base_value >= 10 # Mod changes operator and value
+	always_true = yes # Kept by Mod
+}
+
+# --- Section 6: Edge Cases & Mixes ---
+# KVP value changes from primitive to block (in Mod)
+kvp_to_block = { # Mod changes value to a block
+	child_in_block = mod_value
+	another_child = yes
+} # Comment KVPToBlock Mod
+
+# Block key changes (simulate by delete+add)
+block_key_change_mod = { # Mod changes key
+	value = 1
+	mod_added = yes # Mod adds a child
+} # Comment KeyChange Mod
+
+# Empty block initially
+empty_block = { # Mod adds comment to empty block
+}
+
+# Block with comments on brace line and child comments
+block_with_comments = { # Initial block comment Old # Mod adds to block comment
+	# Initial child comment Old 1 # Mod modifies comment 1
+	# Initial child comment Old 2
+	# Mod adds child comment 2
+	child = yes
+	mod_child = 1 # Mod adds child
+}
+
+# Orphaned nodes (Absent in Mod)
+# Orphan = "value"
+
+# More complex list item modifications
+complex_list_items = {
+	{ complex_block = { x = mod_changed } } # Mod changes x
+	# item_value deleted by Mod
+	"mod string" # Mod modifies quoted string
+	mod_added_item = "mod_added" # Mod adds KVP to list
+}
+
+# --- Section 7: Random List / Weighted Blocks Stress Test ---
+random_list_benchmark = { # Comment RandomList Old # Mod adds to block comment line
+	10 = { # Weight 10 Old # Mod adds to block comment line
+		# Comment 10 Block Old
+		item_a = mod_value # Modified in Mod, Deleted in New
+		item_b = 99 # Modified in Mod and New
+		mod_added_10 = yes # Mod adds to 10 block
+	}
+	20 = { # Weight 20 Old - Deleted in New, Modified in Mod # Mod adds to block comment line
+		item_c = "modded" # Modified in Mod
+		mod_added_20 = no # Mod adds to 20 block
+	}
+	30 = { # Weight 30 Old - Kept in New, Modified in Mod
+		item_d = yes # Modified in Mod
+	}
+	40 = { # Weight 40 Old - Modified in New, Kept in Mod
+		item_e = 1.5 # Kept in Mod
+	}
+	50 = { # Weight 50 Old - Kept Identical
+		item_f = "keep" # Kept Identical
+		# Mod adds comment to 50 block
+	}
+	60 = { # Mod adds 60={...}
+		item_g = "mod_added_60" # Mod adds to 60 block
+		nested_mod_60 = { mod_val = 1 } # Mod adds nested block
+	}
+	# New adds 70={...} (similar to Old 20={...})
+	# New adds 80={...}
+}

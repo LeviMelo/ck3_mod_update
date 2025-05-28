@@ -1,3 +1,47 @@
+# pds_parser.py
+# Defines the lexical and syntactic structures for Paradox Script (PDS) files.
+# Contains:
+#   - PdsToken: Represents a lexical token (type, value, line, column).
+#   - PdsLexer: Tokenizes PDS text into a stream of PdsTokens.
+#               Handles comments, strings, numbers, identifiers, operators, braces.
+#   - PdsNode (and subclasses): Abstract Syntax Tree (AST) nodes.
+#     - PdsComment, PdsBlankLine, PdsKeyValuePair, PdsList,
+#       PdsOperatorCondition, PdsBlock.
+#     - Each node implements:
+#       - to_string(): For reconstructing PDS text from the AST.
+#       - copy(): For deep copying nodes.
+#       - get_structural_components(): For equality checks and hashing,
+#         defining the "structural essence" of a node.
+#       - __eq__, __hash__: Based on structural components.
+#   - PdsParser: Parses a stream of PdsTokens into an AST (a list of PdsNodes).
+#                Handles top-level statements, block structures, lists, KVP, etc.
+#
+# Current Known Issues/Limitations:
+#   - Lexer: Might not handle all edge cases of PDS syntax, especially complex
+#            quoted identifiers or macro expansions if they exist.
+#            Assumes UTF-8 with BOM or UTF-8 encoding.
+#   - Parser:
+#     - List parsing is heuristic (distinguishing `key = { val }` (list) from
+#       `key = { child_key = val }` (block)) and might misinterpret ambiguous cases.
+#     - Error reporting is basic; doesn't implement sophisticated recovery.
+#   - AST Nodes:
+#     - `to_string()` formatting is functional but might not perfectly replicate
+#       original spacing or stylistic choices beyond basic indentation.
+#       The "WARNING: Normalized reconstruction mismatch" messages highlight this.
+#     - `PdsList` `to_string()` has heuristics for inline vs. multi-line.
+#   - Reconstruction Mismatches: The "WARNING: Normalized reconstruction mismatch"
+#     messages indicate that `parser.parse_file()` then `PdsParser._nodes_to_string()`
+#     does not perfectly reproduce the original file content after normalization.
+#     This is often due to:
+#       1. Whitespace differences (e.g., space around '=', number of blank lines).
+#       2. Comment positioning nuances not fully captured/reproduced.
+#       3. Quoting decisions (e.g., an unquoted identifier in input might be quoted
+#          on output if it contains special characters or vice-versa if it doesn't need it).
+#     While structural integrity is the main goal for diffing, these cosmetic
+#     differences can make direct text diffs of reconstructed files noisy.
+#     The `normalize_for_comparison` function in the test script attempts to mitigate this
+#     for comparison purposes, but fundamental `to_string` improvements might be needed
+#     for perfect 1:1 reconstruction if that's a strict requirement.
 import re
 import os
 import sys
