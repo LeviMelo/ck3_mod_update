@@ -1,0 +1,144 @@
+# Ideal Merged Benchmark File
+# This represents the desired content outcome of the 3-way merge
+# based on benchmark_test_old.txt, benchmark_test_mod.txt, and benchmark_test_new.txt
+
+# --- Section 1: Primitive Value Changes & Conflicts ---
+primitive_string = "mod_string_changed"
+primitive_number = 999.9
+primitive_bool = no
+primitive_float = 2.0 # Vanilla changes float
+
+# --- Section 2: Additions, Deletions, Unchanged ---
+delete_mod_modify_new = { # Comment New
+	value = 2 # Vanilla modifies value
+	keep_me = yes
+	vanilla_added_child = no # Vanilla adds child
+}
+add_mod_only = "mod_added" # Comment Mod Added
+# delete_new_only is absent
+modify_mod_delete_new = "modded_value" # Comment Mod Modified
+delete_mod_keep_new = "original"
+keep_identical = "unchanged" # Comment Identical
+# This is a modded comment
+# # Mod replaced blank with comment
+
+# --- Section 3: Lists ---
+simple_list_conflict = { item_a item_v item_e item_added_vanilla item_mod item_d item_added_mod } # Vanilla changed b->item_v, c->item_e, added item_added_vanilla
+multi_line_list = {
+	item_1
+	item_2
+	item_vanilla_added
+	item_mod_added
+}
+list_with_anon_blocks = { # Vanilla adds new anon block
+	{ block_item_1 = mod_value_changed }
+	{ block_item_2 = vanilla_value_changed }
+	{ block_item_3_mod = mod_added }
+	{ block_item_3_vanilla = vanilla_added }
+}
+
+# --- Section 4: Blocks ---
+simple_block_conflict = { # Vanilla adds comment to block
+	# Mod adds child comment
+	# Initial child comment Old 1 # Vanilla modifies comment 1
+	child_kvp = mod_value_changed # Mod changes value
+	child_list = { list_item_x list_item_y list_item_vanilla_z list_item_mod_y }
+	mod_added_child = yes
+}
+parent_block = { # Vanilla adds block comment
+	child_block_level1_mod = { # Vanilla adds comment
+		child_block_level2 = {
+			final_value = "modded" # Modified in Mod
+			mod_added_kvp = 1 # Mod adds child here
+			vanilla_added_kvp = 2 # Vanilla adds child here
+		}
+		mod_added_at_level1 = "mod" # Mod adds KVP here
+	}
+	child_block_level1_new = { # Kept by Vanilla (not deleted)
+		should_be_deleted_by_mod = yes
+	}
+	vanilla_added_block_level1 = { # Vanilla adds block here
+		child = yes
+	}
+}
+modify_mod_delete_new_block = {
+	initial_child = 1
+	new_child_mod = yes # Mod adds new_child_mod here
+}
+delete_mod_modify_new_block = { # Comment DelModBlock New
+	initial_child = 1
+	new_child_van = yes # Vanilla adds new_child_van here
+}
+
+# --- Section 5: Operator Conditions ---
+condition_example = { # Comment CondBlock Old # Vanilla adds to block comment line
+	# Initial child comment CondItem1 Old # Vanilla modifies comment
+	base_value >= 10 # Mod changes operator and value
+	always_true = no # Vanilla changes this KVP's value
+}
+
+# --- Section 6: Edge Cases & Mixes ---
+kvp_to_block = { # Mod changes value to a block
+	child_in_block = mod_value
+	another_child = yes
+} # Comment KVPToBlock Mod
+# block_key_change_old is absent
+block_key_change_mod = { # Mod changes key
+	value = 1
+	mod_added = yes # Mod adds a child
+} # Comment KeyChange Mod
+block_key_change_new = { # Vanilla adds block with new key
+	value = 1
+	vanilla_added = no # Vanilla adds a child
+} # Comment KeyChange New
+empty_block = { # Mod adds comment to empty block
+}
+block_with_comments = { # Initial block comment Old # Vanilla adds to block comment
+	# Initial child comment Old 1 # Mod modifies comment 1
+	# Initial child comment Old 2 # Vanilla modifies comment 2
+	# Mod adds child comment 2
+	child = yes
+	mod_child = 1 # Mod adds child
+}
+complex_list_items = { # Comment ComplexList Old
+	{ complex_block = { x = mod_changed y = 2 } }
+	item_value_vanilla_modified
+	"mod string"
+	mod_added_item = "mod_added"
+}
+
+# --- Section 7: Random List / Weighted Blocks Stress Test ---
+random_list_benchmark = { # Comment RandomList Old # Vanilla adds to block comment line
+	10 = { # Weight 10 Old # Mod adds to block comment line
+		# Comment 10 Block Old
+		item_a = mod_value # Modified in Mod, Deleted in New
+		item_b = 99 # Modified in Mod and New
+		mod_added_10 = yes # Mod adds to 10 block
+	}
+	20 = { # Weight 20 Old - Deleted in New, Modified in Mod # Mod adds to block comment line
+		item_c = "modded" # Modified in Mod
+		mod_added_20 = no # Mod adds to 20 block
+	}
+	30 = { # Weight 30 Old - Kept in New, Modified in Mod
+		item_d = yes # Modified in Mod
+	}
+	40 = { # Weight 40 Old - Modified in New, Kept in Mod
+		item_e = 2.5 # Modified in New
+		vanilla_added_40 = no # Vanilla adds to 40 block
+	}
+	50 = { # Weight 50 Old - Kept Identical # Vanilla adds comment to 50 block
+		# Mod adds comment to 50 block
+		item_f = "keep" # Kept Identical
+	}
+	60 = { # Mod adds 60={...}
+		item_g = "mod_added_60" # Mod adds to 60 block
+		nested_mod_60 = { mod_val = 1 } # Mod adds nested block
+	}
+	70 = { # New adds 70={...} (similar to Old 20={...})
+		item_c = "original" # Content from Old 20
+		new_added_70 = yes # Vanilla adds to 70 block
+	}
+	80 = { # New adds 80={...}
+		item_h = 5 # Vanilla adds to 80 block
+	}
+}

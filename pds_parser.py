@@ -709,13 +709,12 @@ class PdsParser:
             self._error(f"Expected a primitive value or an anonymous block {{...}} as RHS value")
         return None
 
-    def _parse_statement(self): # Renamed from _parse_statement_or_item. This parses KVP, OpCond, or Block.
+    def _parse_statement(self):
         start_token_line = self._peek().line
 
         if self._is_next('LBRACE'): # Anonymous block
             return self._parse_block_content(key_for_block=None, line_of_key=start_token_line)
 
-        # Ensure next token is a valid start for a statement
         if not (self._is_next('IDENTIFIER') or self._is_next('NUMBER') or self._is_next('STRING')):
              self._error("Statement must start with IDENTIFIER, NUMBER, STRING, or LBRACE for anonymous block")
 
@@ -729,39 +728,49 @@ class PdsParser:
 
         if self._is_next('EQUALS'):
             self._consume('EQUALS')
-            if self._is_next('LBRACE'): # key = { ... } (Block or List)
-                return self._parse_block_or_list_after_equals(key_for_node, key_line)
+            if self._is_next('LBRACE'): # Found pattern: key = { ... }
+                # In this case, the '{...}' part is the VALUE of a KeyValuePair.
+                # _parse_block_or_list_after_equals will return the PdsBlock or PdsList object.
+                value_node = self._parse_block_or_list_after_equals(key_for_node, key_line) # Returns PdsBlock or PdsList
+                
+                comment_on_kvp_line = None
+                # Check for same-line comment immediately after the closing brace of the block/list
+                # The token *before* current_token_index is the '}' of the block/list.
+                last_value_token_line = self.tokens[self.current_token_index -1].line if self.current_token_index > 0 else key_line
+                if self._is_next('COMMENT') and self._peek().line == last_value_token_line:
+                    comment_on_kvp_line = self._consume('COMMENT').value
+                
+                return PdsKeyValuePair(key_for_node, value_node, key_line, comment_on_kvp_line)
             else: # key = primitive_value
                 val_node_content = self._parse_value_for_kvp_or_op() # This consumes its token
                 
                 comment_on_kvp_line = None
-                # Check for same-line comment immediately after value and on the same line as the *key* (or value's end line if multi-line).
-                # For single-line KVP, it's typically the line of the key.
                 if self._is_next('COMMENT') and self._peek().line == key_line:
                     comment_on_kvp_line = self._consume('COMMENT').value
                 return PdsKeyValuePair(key_for_node, val_node_content, key_line, comment_on_kvp_line)
         
-        elif self._is_next('OPERATOR'):
+        elif self._is_next('OPERATOR'): # key > value
+            # ... (this part remains unchanged) ...
             op_token = self._consume('OPERATOR')
             val_node_content = self._parse_value_for_kvp_or_op() # This consumes its token
             
             comment_on_op_line = None
-            if self._is_next('COMMENT') and self._peek().line == key_line: # Same-line comment for operator condition
+            if self._is_next('COMMENT') and self._peek().line == key_line:
                  comment_on_op_line = self._consume('COMMENT').value
             return PdsOperatorCondition(key_for_node, op_token.value, val_node_content, key_line, comment_on_op_line)
         
         elif self._is_next('LBRACE'): # key { ... } (named block, not RHS of equals)
+            # This is specifically for syntax like `modifier = { ... }` in CK3, where no `=` is present.
+            # It directly returns a PdsBlock node.
             return self._parse_block_content(key_for_node, key_line)
             
-        else: # This path is ONLY for bare primitive values in a list (e.g. `item_a` in `{ item_a item_b }`)
-            # We already consumed `key_candidate_token`. Interpret it as a primitive value.
-            primitive_val = self._parse_primitive_value(key_candidate_token) # Interpret the already consumed token
-            if primitive_val is not None:
-                return primitive_val # This is the ONLY place a raw primitive is returned by `_parse_statement`.
-            else:
-                self._error(f"Unexpected token sequence after '{key_raw_value}'. Expected '=', operator, or '{{', or bare value (if in list).")
+        else: # Bare primitive value (e.g. in a list: `my_list = { val1 val2 }`)
+            # ... (this part remains unchanged) ...
+            primitive_val = self._parse_primitive_value(key_candidate_token)
+            if primitive_val is not None: return primitive_val
+            else: self._error(f"Unexpected token sequence after '{key_raw_value}'. Expected '=', operator, or '{{', or bare value (if in list).")
         return None
-
+    
     def _parse_block_or_list_after_equals(self, key_str_for_node, key_line_for_node):
         lbrace_token = self._consume('LBRACE')
         

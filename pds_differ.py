@@ -66,7 +66,7 @@ class PdsChange:
         self.new_node = new_node
         self.context_parent_path = context_parent_path if context_parent_path is not None else []
         
-        # Add original line numbers for sorting and insertion heuristics
+        # ADDED: Store original line numbers for sorting and insertion heuristics
         self.mod_line_number = mod_node.line_number if isinstance(mod_node, PdsNode) else -1
         self.new_line_number = new_node.line_number if isinstance(new_node, PdsNode) else -1
         self.old_line_number = old_node.line_number if isinstance(old_node, PdsNode) else -1
@@ -131,100 +131,105 @@ def get_node_diff_key_for_find(node_or_primitive, index_in_list=None):
     """
     Generates a stable, unique-ish string key for a PdsNode or primitive value,
     suitable for use as the *base* part of a diff path segment.
-    
-    For keyed nodes (KVP, Block, List, OperatorCondition), it primarily uses their `key` attribute.
-    For non-keyed/anonymous nodes (Comments, BlankLines, anonymous Blocks in lists),
-    it generates a synthetic key, often incorporating a stable hash of its content
-    and/or its index, to help `difflib.SequenceMatcher` identify matching items.
-    
-    Args:
-        node_or_primitive: The PdsNode instance or primitive value.
-        index_in_list (int, optional): The 0-based index of the item within its
-                                       parent list/children collection. This is
-                                       important for making anonymous/duplicate items
-                                       more distinguishable for initial base key generation.
-    Returns:
-        str: A string representing the base diff key for this item.
     """
+    # ... (function body as previously provided, no `is_for_path_segment` parameter) ...
     base_key = ""
     if isinstance(node_or_primitive, PdsNode):
         node = node_or_primitive
-        if hasattr(node, 'key') and node.key is not None:
-            # For keyed nodes, the key itself is the primary identifier.
-            # Assume game keys don't use '___' literally, as it's our internal delimiter.
-            base_key = str(node.key)
-        elif isinstance(node, PdsComment):
-            # For comments, a hash of its content for stability.
-            # `strip()` ensures leading/trailing spaces don't alter the hash.
-            base_key = f"__COMMENT_H{hash(node.comment_text.strip())}" 
-        elif isinstance(node, PdsBlankLine):
-            # All blank lines are structurally identical. Use class name hash.
-            base_key = f"__BLANK_LINE_H{hash(node.__class__.__name__)}"
-        elif isinstance(node, PdsBlock) and node.key is None: # Anonymous block
-            # For anonymous blocks, use its index in the parent list and a shallow structural hash.
-            # Shallow hash prevents changes deep inside affecting the block's *identity*.
-            # The `index_in_list` helps distinguish multiple identical anonymous blocks.
-            if index_in_list is not None:
-                base_key = f"__ANONBLOCK_IDX{index_in_list}_H{hash(node.get_structural_components(shallow_block=True))}"
-            else: # Fallback for cases where index is unavailable (less robust)
-                base_key = f"__ANONBLOCK_H{hash(node.get_structural_components(shallow_block=True))}"
-        else: # Generic PdsNode without a specific 'key' attribute
-            # Fallback for other non-keyed PdsNodes.
+        if hasattr(node, 'key') and node.key is not None: base_key = str(node.key)
+        elif isinstance(node, PdsComment): base_key = f"__COMMENT_H{hash(node.comment_text.strip())}" 
+        elif isinstance(node, PdsBlankLine): base_key = f"__BLANK_LINE_H{hash(node.__class__.__name__)}"
+        elif isinstance(node, PdsBlock) and node.key is None:
+            if index_in_list is not None: base_key = f"__ANONBLOCK_IDX{index_in_list}_H{hash(node.get_structural_components(shallow_block=True))}"
+            else: base_key = f"__ANONBLOCK_H{hash(node.get_structural_components(shallow_block=True))}"
+        else: 
             cls_name_part = f"__{node.__class__.__name__.upper()}"
-            if index_in_list is not None:
-                base_key = f"{cls_name_part}_IDX{index_in_list}_H{hash(node.get_structural_components())}"
-            else: # Fallback: use full hash
-                base_key = f"{cls_name_part}_H{hash(node.get_structural_components())}"
-    else: # Primitive value (str, int, float, bool)
-        # For primitive values, use their type and a hash of their value.
+            if index_in_list is not None: base_key = f"{cls_name_part}_IDX{index_in_list}_H{hash(node.get_structural_components())}"
+            else: base_key = f"{cls_name_part}_H{hash(node.get_structural_components())}"
+    else: 
         type_name = type(node_or_primitive).__name__
-        val_for_hash = str(node_or_primitive)[:50] if isinstance(node_or_primitive, str) else node_or_primitive # Limit string length for hash input
-        if index_in_list is not None:
-            base_key = f"__PRIMITIVE_{type_name}_IDX{index_in_list}_H{hash(val_for_hash)}"
-        else:
-            base_key = f"__PRIMITIVE_{type_name}_H{hash(val_for_hash)}"
-    
+        val_for_hash = str(node_or_primitive)[:50] if isinstance(node_or_primitive, str) else node_or_primitive
+        if index_in_list is not None: base_key = f"__PRIMITIVE_{type_name}_IDX{index_in_list}_H{hash(val_for_hash)}"
+        else: base_key = f"__PRIMITIVE_{type_name}_H{hash(val_for_hash)}"
     return base_key
 
 
 def _find_node_by_diff_path_in_tree(current_level_items_or_container: list | PdsBlock | PdsList, diff_path_list: list[str]):
-    target_item = None 
+    """
+    Navigates through the AST (or a sub-tree) to find a specific node
+    based on a list of diff path segments.
     
-    search_context = []
-    if isinstance(current_level_items_or_container, list): search_context = current_level_items_or_container
-    elif isinstance(current_level_items_or_container, PdsBlock): search_context = current_level_items_or_container.children
-    elif isinstance(current_level_items_or_container, PdsList): search_context = current_level_items_or_container.values
-    else: return None
+    Args:
+        current_level_items_or_container: The current list of nodes (e.g., root list,
+            or children of a block/list) to start the search from.
+        diff_path_list: A list of string segments representing the path to the target node.
+            Each segment can include the '___N' occurrence suffix.
+            
+    Returns:
+        PdsNode or primitive value: The found node/primitive, or None if not found.
+    """
+    
+    # Initialize the current search context based on the input container.
+    # If the initial container is not a recognized type, return None immediately.
+    if isinstance(current_level_items_or_container, list):
+        current_search_context = current_level_items_or_container
+    elif isinstance(current_level_items_or_container, PdsBlock):
+        current_search_context = current_level_items_or_container.children
+    elif isinstance(current_level_items_or_container, PdsList):
+        current_search_context = current_level_items_or_container.values
+    else:
+        # If the starting point is not a list or a known container node type,
+        # it's an invalid path for traversal, so return None.
+        return None
 
+    target_item = None # Will store the node found at each segment
+    
+    # Iterate through each segment of the diff path
     for seg_idx, seg_str in enumerate(diff_path_list):
         key_part_from_path, occurrence_from_path, is_indexed_path_segment = _parse_indexed_identifier_for_nav(seg_str)
         
-        current_item_occurrence_count = {} 
-        found_this_segment_item = None
+        item_found_in_current_segment = None
+        current_base_key_occurrence_count = collections.defaultdict(int)
         
-        for item_idx, item_in_level in enumerate(search_context):
-            # UPDATED CALL
-            item_base_key = get_node_diff_key_for_find(item_in_level, index_in_list=item_idx)
+        # Search for the item corresponding to the current segment within the current context
+        for item_in_level_idx, item_in_level in enumerate(current_search_context):
+            # Generate the base key for the current item in the iteration.
+            item_base_key = get_node_diff_key_for_find(item_in_level, index_in_list=item_in_level_idx)
             
+            # Check if this item's base key matches the segment's key part
             if item_base_key == key_part_from_path:
-                current_occurrence = current_item_occurrence_count.get(item_base_key, 0)
+                # Check if the occurrence matches (if the path segment specified an occurrence)
                 target_occurrence_for_match = occurrence_from_path if is_indexed_path_segment else 0
-                if current_occurrence == target_occurrence_for_match:
-                    found_this_segment_item = item_in_level
-                    break
-                current_item_occurrence_count[item_base_key] = current_occurrence + 1
+                if current_base_key_occurrence_count[item_base_key] == target_occurrence_for_match:
+                    item_found_in_current_segment = item_in_level
+                    break # Found the exact item for this segment
+                current_base_key_occurrence_count[item_base_key] += 1 # Increment occurrence for this base key
         
-        if found_this_segment_item is None: return None
-        target_item = found_this_segment_item
+        if item_found_in_current_segment is None:
+            # Item for current segment not found in the current context, so the full path is invalid.
+            return None
         
-        if seg_idx == len(diff_path_list) - 1: return target_item
-        else: 
-            if isinstance(target_item, PdsBlock): search_context = target_item.children
-            elif isinstance(target_item, PdsKeyValuePair) and isinstance(target_item.value, PdsBlock): search_context = target_item.value.children
-            elif isinstance(target_item, PdsList): search_context = target_item.values
-            else: return None 
-    return None 
-
+        target_item = item_found_in_current_segment # Store the item found for this segment
+        
+        if seg_idx == len(diff_path_list) - 1:
+            # This is the last segment in the path, so `target_item` is the final node we're looking for.
+            return target_item
+        else:
+            # Not the last segment, so prepare for the next level of traversal.
+            # The next `current_search_context` will be the children/values of the `target_item`.
+            if isinstance(target_item, PdsBlock):
+                current_search_context = target_item.children
+            elif isinstance(target_item, PdsKeyValuePair) and isinstance(target_item.value, PdsBlock):
+                # If a KVP's value is a block, we need to search within that block's children.
+                current_search_context = target_item.value.children
+            elif isinstance(target_item, PdsList):
+                current_search_context = target_item.values
+            else:
+                # If the `target_item` is not a container (Block, KVP with Block value, or List),
+                # and it's not the last segment, then the path is invalid for further traversal.
+                return None
+    
+    return None # Should not be reached in a valid scenario if loop completes, but included for safety.
 
 def _find_container_by_key_path(root_items_list: list, container_diff_path: list[str]):
     # ... (content as before, it already uses _find_node_by_diff_path_in_tree) ...
@@ -656,24 +661,22 @@ class PdsDiffer:
         else: 
             return item1 == item2
 
-    def _perform_pairwise_diff(self, list1_items: list, list2_items: list, current_path_prefix: list[str]):
+    def _perform_pairwise_diff(self, list1_items: list, list2_items: list, current_path_prefix: list[str]) -> list[PairwiseDiffResult]:
         """
-        Performs a pairwise diff between two lists of PdsNodes/primitives.
+        Performs a pairwise diff between two lists of PdsNodes/primitives using `difflib.SequenceMatcher`.
         Recurses into nested blocks and lists that contain structured nodes.
         Generates unique paths for all items, including occurrence suffixes for duplicates.
+        Properly distinguishes simple 1-to-1 modifications from complex replacements.
         """
         pairwise_changes = []
         
         # Use `get_comparator_key()` (which uses PdsNode.__hash__) for SequenceMatcher.
-        # This provides a stable "fingerprint" for each item.
         seq_match_items1 = [item.get_comparator_key() if isinstance(item, PdsNode) else item for item in list1_items]
         seq_match_items2 = [item.get_comparator_key() if isinstance(item, PdsNode) else item for item in list2_items]
         
         sm = difflib.SequenceMatcher(None, seq_match_items1, seq_match_items2, autojunk=False)
         
-        # Tracks occurrences of base keys for list1 to generate unique path segments
-        # (e.g., if "item_a" appears twice, path might be "item_a___0" then "item_a___1").
-        # This is CRITICAL for stable paths for identical items.
+        # Tracks occurrences of base keys for list1 to generate unique path segments.
         path_segment_occurrence_counter = collections.defaultdict(int)
 
         for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -682,11 +685,7 @@ class PdsDiffer:
                     l1_idx, l2_idx = i1 + idx_offset, j1 + idx_offset
                     item1_orig, item2_orig = list1_items[l1_idx], list2_items[l2_idx] 
                     
-                    # Generate the base path segment string for this item.
-                    # This base segment might not be globally unique if identical items exist.
                     base_path_segment_str = get_node_diff_key_for_find(item1_orig, index_in_list=l1_idx)
-                    
-                    # Append an occurrence suffix if this base segment has appeared before within this list.
                     current_occurrence = path_segment_occurrence_counter[base_path_segment_str]
                     final_path_segment = f"{base_path_segment_str}___{current_occurrence}" if current_occurrence > 0 else base_path_segment_str
                     path_segment_occurrence_counter[base_path_segment_str] += 1
@@ -695,39 +694,54 @@ class PdsDiffer:
                     
                     pairwise_changes.append(PairwiseDiffResult('IDENTICAL', item_path, item1_orig, item2_orig, l1_idx, l2_idx))
                     
-                    # Recurse into children of blocks and lists of PdsNodes
                     if isinstance(item1_orig, PdsBlock) and isinstance(item2_orig, PdsBlock):
                         pairwise_changes.extend(self._perform_pairwise_diff(item1_orig.children, item2_orig.children, item_path))
                     elif isinstance(item1_orig, PdsList) and isinstance(item2_orig, PdsList):
-                        # Only recurse into lists if they contain structured nodes (PdsNode instances).
-                        # Primitive-only lists are compared as a whole.
                         if any(isinstance(v, PdsNode) for v in item1_orig.values) or \
                            any(isinstance(v, PdsNode) for v in item2_orig.values):
                              pairwise_changes.extend(self._perform_pairwise_diff(item1_orig.values, item2_orig.values, item_path))
 
             elif tag == 'replace':
-                # An M-to-N replacement is broken down into DELETEs from list1 and ADDs to list2.
-                # This ensures individual items are properly tracked.
-                for k_del_offset in range(i2 - i1): 
-                    l1_idx_del = i1 + k_del_offset
-                    item_to_delete = list1_items[l1_idx_del]
-                    base_path_segment_str_del = get_node_diff_key_for_find(item_to_delete, index_in_list=l1_idx_del)
-                    current_occurrence_del = path_segment_occurrence_counter[base_path_segment_str_del]
-                    final_path_segment_del = f"{base_path_segment_str_del}___{current_occurrence_del}" if current_occurrence_del > 0 else base_path_segment_str_del
-                    path_segment_occurrence_counter[base_path_segment_str_del] += 1
-                    item_path_del = current_path_prefix + [final_path_segment_del]
-                    pairwise_changes.append(PairwiseDiffResult('DELETED', item_path_del, item_to_delete, None, l1_idx_del, -1))
+                # Distinction: Simple 1-to-1 modification vs. complex M-to-N replacement.
+                if (i2 - i1) == 1 and (j2 - j1) == 1: # A single item from list1 is replaced by a single item in list2
+                    l1_idx, l2_idx = i1, j1 # Only one item is involved in each list
+                    item1_orig, item2_orig = list1_items[l1_idx], list2_items[l2_idx]
+                    
+                    base_path_segment_str = get_node_diff_key_for_find(item1_orig, index_in_list=l1_idx)
+                    current_occurrence = path_segment_occurrence_counter[base_path_segment_str]
+                    final_path_segment = f"{base_path_segment_str}___{current_occurrence}" if current_occurrence > 0 else base_path_segment_str
+                    path_segment_occurrence_counter[base_path_segment_str] += 1
+                    item_path = current_path_prefix + [final_path_segment]
+                    
+                    # Mark it as a direct MODIFIED change
+                    pairwise_changes.append(PairwiseDiffResult('MODIFIED', item_path, item1_orig, item2_orig, l1_idx, l2_idx))
+                    
+                    # Recurse for nested blocks/lists.
+                    if isinstance(item1_orig, PdsBlock) and isinstance(item2_orig, PdsBlock):
+                        pairwise_changes.extend(self._perform_pairwise_diff(item1_orig.children, item2_orig.children, item_path))
+                    elif isinstance(item1_orig, PdsList) and isinstance(item2_orig, PdsList):
+                        if any(isinstance(v, PdsNode) for v in item1_orig.values) or \
+                           any(isinstance(v, PdsNode) for v in item2_orig.values):
+                             pairwise_changes.extend(self._perform_pairwise_diff(item1_orig.values, item2_orig.values, item_path))
+                else: # This is a complex M-to-N replacement: treat as series of DELETEDs then ADDEDs
+                    for k_del_offset in range(i2 - i1): 
+                        l1_idx_del = i1 + k_del_offset
+                        item_to_delete = list1_items[l1_idx_del]
+                        base_path_segment_str_del = get_node_diff_key_for_find(item_to_delete, index_in_list=l1_idx_del)
+                        current_occurrence_del = path_segment_occurrence_counter[base_path_segment_str_del]
+                        final_path_segment_del = f"{base_path_segment_str_del}___{current_occurrence_del}" if current_occurrence_del > 0 else base_path_segment_str_del
+                        path_segment_occurrence_counter[base_path_segment_str_del] += 1
+                        item_path_del = current_path_prefix + [final_path_segment_del]
+                        pairwise_changes.append(PairwiseDiffResult('DELETED', item_path_del, item_to_delete, None, l1_idx_del, -1))
 
-                for k_add_offset in range(j2 - j1): 
-                    l2_idx_add = j1 + k_add_offset
-                    item_to_add = list2_items[l2_idx_add]
-                    # For added items, the path segment needs to be unique.
-                    # We use a special '___INSERTED_' suffix for identification during reconciliation.
-                    base_path_segment_str_add = get_node_diff_key_for_find(item_to_add, index_in_list=l2_idx_add)
-                    item_path_add = current_path_prefix + [f"{base_path_segment_str_add}___INSERTED_REPLACE_OldStart{i1}_NewIdx{l2_idx_add}"]
-                    pairwise_changes.append(PairwiseDiffResult('ADDED', item_path_add, None, item_to_add, -1, l2_idx_add))
+                    for k_add_offset in range(j2 - j1): 
+                        l2_idx_add = j1 + k_add_offset
+                        item_to_add = list2_items[l2_idx_add]
+                        base_path_segment_str_add = get_node_diff_key_for_find(item_to_add, index_in_list=l2_idx_add)
+                        item_path_add = current_path_prefix + [f"{base_path_segment_str_add}___INSERTED_REPLACE_OldStart{i1}_NewIdx{l2_idx_add}"]
+                        pairwise_changes.append(PairwiseDiffResult('ADDED', item_path_add, None, item_to_add, -1, l2_idx_add))
 
-            elif tag == 'delete': 
+            elif tag == 'delete': # An item was deleted from list1
                 for k_offset in range(i2 - i1): 
                     l1_idx = i1 + k_offset
                     item_deleted = list1_items[l1_idx]
@@ -738,7 +752,7 @@ class PdsDiffer:
                     item_path_del = current_path_prefix + [final_path_segment]
                     pairwise_changes.append(PairwiseDiffResult('DELETED', item_path_del, item_deleted, None, l1_idx, -1))
 
-            elif tag == 'insert': 
+            elif tag == 'insert': # An item was inserted into list2 (not present in list1)
                 for k_offset in range(j2 - j1): 
                     l2_idx = j1 + k_offset
                     item_added = list2_items[l2_idx]
@@ -747,113 +761,205 @@ class PdsDiffer:
                     pairwise_changes.append(PairwiseDiffResult('ADDED', item_path_add, None, item_added, -1, l2_idx))
         return pairwise_changes
 
-    def diff_nodes(self, old_nodes_root: list[PdsNode], mod_nodes_root: list[PdsNode], new_nodes_root: list[PdsNode]):
-        mod_diffs = self._perform_pairwise_diff(old_nodes_root, mod_nodes_root, [])
-        van_diffs = self._perform_pairwise_diff(old_nodes_root, new_nodes_root, [])
-
-        mod_map = {'.'.join(d.path): d for d in mod_diffs}
-        van_map = {'.'.join(d.path): d for d in van_diffs}
+    def diff_nodes(self, old_nodes_root: list[PdsNode], mod_nodes_root: list[PdsNode], new_nodes_root: list[PdsNode]) -> list[PdsChange]:
+        """
+        Orchestrates the 3-way diff. It performs pairwise diffs (Old vs Mod, Old vs New)
+        and then reconciles them into a list of PdsChange objects representing the
+        three-way differences and conflicts.
         
-        all_paths_str = sorted(list(set(mod_map.keys()) | set(van_map.keys())))
-        final_changes = [] 
+        This version robustly handles delete+insert pairs as effective modifications.
+        """
+        mod_pairwise_diffs = self._perform_pairwise_diff(old_nodes_root, mod_nodes_root, [])
+        van_pairwise_diffs = self._perform_pairwise_diff(old_nodes_root, new_nodes_root, [])
 
-        for path_str in all_paths_str:
-            p_list = path_str.split('.') 
-            context_parent_path = p_list[:-1] 
+        # Create a unified map of all pairwise changes, indexed by canonical path.
+        # This map will help in identifying DELETED + ADDED pairs as MODIFICATIONS.
+        # Structure: { canonical_path: { 'mod_diffs': [PairwiseDiffResult], 'van_diffs': [PairwiseDiffResult] } }
+        all_canonical_paths = set()
+        
+        # Helper to get the base path for an item, removing '___INSERTED_' suffix if present.
+        # This allows a DELETED and ADDED pair to be associated with the same "logical" path.
+        def get_canonical_path(path_list: list[str]) -> str:
+            if not path_list: return "" # Root path
+            last_segment = path_list[-1]
+            if '___INSERTED_' in last_segment:
+                return '.'.join(path_list[:-1] + [last_segment.split('___INSERTED_')[0]])
+            return '.'.join(path_list)
 
-            mod_c = mod_map.get(path_str) 
-            van_c = van_map.get(path_str) 
+        # Populate the unified map with all pairwise diffs
+        unified_changes_map = collections.defaultdict(lambda: {'mod_diffs': [], 'van_diffs': []})
 
-            o_item, m_item, n_item = None, None, None 
-            s_om_type, s_on_type = 'ABSENT_IN_MOD_DIFF', 'ABSENT_IN_VANILLA_DIFF'
+        for d in mod_pairwise_diffs:
+            canonical_path_str = get_canonical_path(d.path)
+            unified_changes_map[canonical_path_str]['mod_diffs'].append(d)
+            all_canonical_paths.add(canonical_path_str)
 
-            # Determine original item (o_item)
-            if mod_c and mod_c.old_item is not None: o_item = mod_c.old_item
-            elif van_c and van_c.old_item is not None: o_item = van_c.old_item
+        for d in van_pairwise_diffs:
+            canonical_path_str = get_canonical_path(d.path)
+            unified_changes_map[canonical_path_str]['van_diffs'].append(d)
+            all_canonical_paths.add(canonical_path_str)
+
+        final_changes = []
+
+        # Process each canonical path to determine the final 3-way change type
+        for path_str in sorted(list(all_canonical_paths)):
+            p_list = path_str.split('.')
+            context_parent_path = p_list[:-1]
+
+            mod_diffs_for_path = unified_changes_map[path_str]['mod_diffs']
+            van_diffs_for_path = unified_changes_map[path_str]['van_diffs']
+
+            # Determine the effective state for Mod and Vanilla relative to Old.
+            # This is where 'delete' + 'add' pairs are resolved into 'modified'.
             
-            # Determine Mod's state (m_item, s_om_type)
-            if mod_c:
-                s_om_type = mod_c.change_type
-                m_item = mod_c.new_item if s_om_type != 'DELETED' else None
-            elif o_item is not None: # Mod didn't touch this path, so it's identical to Old
-                s_om_type = 'IDENTICAL'; m_item = o_item 
+            # --- Effective Mod State (m_node represents the resulting item in Mod) ---
+            mod_effective_state = 'IDENTICAL' # Default: No change, so identical to Old
+            m_node = _find_node_by_diff_path_in_tree(old_nodes_root, p_list) # Attempt to find Old node as default
+
+            mod_deleted_item = None
+            mod_added_item = None
+
+            for d in mod_diffs_for_path:
+                if d.change_type == 'MODIFIED':
+                    mod_effective_state = 'MODIFIED'
+                    m_node = d.new_item
+                    break # Direct modification is definitive, no need to check other pairwise diffs for this path
+                elif d.change_type == 'ADDED':
+                    mod_added_item = d.new_item
+                elif d.change_type == 'DELETED':
+                    mod_deleted_item = d.old_item
+                elif d.change_type == 'IDENTICAL':
+                    mod_effective_state = 'IDENTICAL'
+                    m_node = d.new_item # Should be identical to Old node, or original if Old was None
+                    break # Identical is definitive
+
+            # If no direct MODIFIED/IDENTICAL found, resolve composite state from DELETED/ADDED
+            if mod_effective_state == 'IDENTICAL': # Still default, so check composite
+                if mod_deleted_item and mod_added_item: # Mod deleted Old item AND added a new one at same logical slot
+                    mod_effective_state = 'MODIFIED' # Treat as a composite modification
+                    m_node = mod_added_item # The resulting new item from Mod
+                elif mod_deleted_item: # Mod deleted Old item, but no corresponding add
+                    mod_effective_state = 'DELETED'
+                    m_node = None
+                elif mod_added_item: # Mod added an item, and no corresponding delete from Old at this path
+                    mod_effective_state = 'ADDED'
+                    m_node = mod_added_item
+                elif not mod_diffs_for_path and o_node_for_pds_change is None: # No diffs from Mod, and no item in Old -> Absent
+                    mod_effective_state = 'ABSENT'
+                    m_node = None
+                # If mod_effective_state is still 'IDENTICAL' here, it truly means it's identical to Old.
+
+
+            # --- Effective Vanilla State (n_node represents the resulting item in Vanilla) ---
+            van_effective_state = 'IDENTICAL' # Default: No change, so identical to Old
+            n_node = _find_node_by_diff_path_in_tree(old_nodes_root, p_list) # Attempt to find Old node as default
+
+            van_deleted_item = None
+            van_added_item = None
+
+            for d in van_diffs_for_path:
+                if d.change_type == 'MODIFIED':
+                    van_effective_state = 'MODIFIED'
+                    n_node = d.new_item
+                    break # Direct modification is definitive
+                elif d.change_type == 'ADDED':
+                    van_added_item = d.new_item
+                elif d.change_type == 'DELETED':
+                    van_deleted_item = d.old_item
+                elif d.change_type == 'IDENTICAL':
+                    van_effective_state = 'IDENTICAL'
+                    n_node = d.new_item # Should be identical to Old node, or original if Old was None
+                    break
             
-            # Determine Vanilla's state (n_item, s_on_type)
-            if van_c:
-                s_on_type = van_c.change_type
-                n_item = van_c.new_item if s_on_type != 'DELETED' else None
-            elif o_item is not None: # Vanilla didn't touch this path, so it's identical to Old
-                s_on_type = 'IDENTICAL'; n_item = o_item
+            # If no direct MODIFIED/IDENTICAL found, resolve composite state from DELETED/ADDED
+            if van_effective_state == 'IDENTICAL': # Still default, so check composite
+                if van_deleted_item and van_added_item: # Vanilla deleted Old item AND added a new one at same logical slot
+                    van_effective_state = 'MODIFIED' # Treat as a composite modification
+                    n_node = van_added_item # The resulting new item from Vanilla
+                elif van_deleted_item: # Vanilla deleted Old item, but no corresponding add
+                    van_effective_state = 'DELETED'
+                    n_node = None
+                elif van_added_item: # Vanilla added an item, and no corresponding delete from Old at this path
+                    van_effective_state = 'ADDED'
+                    n_node = van_added_item
+                elif not van_diffs_for_path and o_node_for_pds_change is None: # No diffs from Vanilla, and no item in Old -> Absent
+                    van_effective_state = 'ABSENT'
+                    n_node = None
             
-            # Special handling for "ABSENT" comments which represent deletions (as parsed by lexer)
-            if isinstance(m_item, PdsComment) and "(Absent)" in m_item.comment_text: m_item = None; s_om_type = 'DELETED'
-            if isinstance(n_item, PdsComment) and "(Absent)" in n_item.comment_text: n_item = None; s_on_type = 'DELETED'
-            # Also, if a node was a comment/blank line in Old and now is None in Mod/New, confirm deletion
-            # This is handled implicitly by `_perform_pairwise_diff` creating DELETED PairwiseDiffResult.
-            # No explicit change needed here for comments/blank lines being None.
-
-            f_type = "UNHANDLED_RECONCILIATION_CASE" 
-
-            if s_om_type == 'IDENTICAL':
-                if s_on_type == 'IDENTICAL': continue # No change in both branches
-                elif s_on_type == 'MODIFIED': f_type = 'VANILLA_MODIFIED'
-                elif s_on_type == 'ADDED':    f_type = 'VANILLA_ADDED' 
-                elif s_on_type == 'DELETED':  f_type = 'VANILLA_DELETED'
-            elif s_om_type == 'MODIFIED':
-                if s_on_type == 'IDENTICAL':  f_type = 'MOD_MODIFIED'
-                elif s_on_type == 'MODIFIED':
-                    f_type = 'CONVERGED_MODIFICATION' if self._are_nodes_structurally_equal(m_item, n_item) else 'CONFLICT_MODIFIED'
-                elif s_on_type == 'ADDED': # Mod modified, Vanilla added at same path. This is an unexpected state.
-                    f_type = 'ERROR_MOD_MODIFIED_VANILLA_ADDED_AT_SAME_PATH' 
-                elif s_on_type == 'DELETED': # Mod modified, Vanilla deleted
-                    f_type = 'CONFLICT_DELETION_VANILLA_DELETED_MOD_MODIFIED'
-            elif s_om_type == 'ADDED': 
-                if s_on_type == 'IDENTICAL': 
-                    f_type = 'MOD_ADDED'     
-                elif s_on_type == 'MODIFIED': # Mod added, Vanilla modified. This should not happen at same path for same Old item.
-                    f_type = 'ERROR_MOD_ADDED_VANILLA_MODIFIED_AT_SAME_PATH'
-                elif s_on_type == 'ADDED': # Mod added, Vanilla also added.
-                    f_type = 'MOD_ADDED_CONVERGED' if self._are_nodes_structurally_equal(m_item, n_item) else 'CONFLICT_ADDITION'
-                elif s_on_type == 'DELETED': # Mod added, Vanilla deleted. This is very rare.
-                    f_type = 'ERROR_MOD_ADDED_VANILLA_DELETED_AT_SAME_PATH' 
-                
-            elif s_om_type == 'DELETED': 
-                if s_on_type == 'IDENTICAL': 
-                    f_type = 'MOD_DELETED'
-                elif s_on_type == 'MODIFIED': 
-                    f_type = 'CONFLICT_DELETION_MOD_DELETED_VANILLA_MODIFIED'
-                elif s_on_type == 'ADDED': # Mod deleted, Vanilla added. This means item was deleted but something new appeared at that location.
-                    f_type = 'ERROR_MOD_DELETED_VANILLA_ADDED_AT_SAME_PATH'
-                elif s_on_type == 'DELETED': 
-                    f_type = 'MOD_DELETED_VANILLA_ALSO_DELETED'
+            # --- Determine the final 3-way change type (f_type) ---
+            f_type = "UNHANDLED_RECONCILIATION_CASE"
             
-            # If still unhandled, or if it's a comment/blank line that was only present in Old, then filter.
-            # This is important to avoid noisy diffs from formatting changes.
-            if f_type == "UNHANDLED_RECONCILIATION_CASE":
-                 # If it's a comment/blank line in Old, and it's missing in both Mod and New, it's effectively a cleanup.
-                 # Filter these out unless they were specifically added.
-                 if isinstance(o_item, (PdsComment, PdsBlankLine)) and m_item is None and n_item is None:
-                     continue # Ignore these as non-structural deletions
-                 # If it's a comment/blank line and only one branch modified it (but it was deleted by other).
-                 # The explicit types CONFLICT_DELETION_... should handle this, so filter out if not.
-                 elif isinstance(o_item, (PdsComment, PdsBlankLine)) and (m_item is None or n_item is None):
-                     # If it's a non-structural element that's been removed in one branch and left untouched in another.
-                     # We'll just ignore these.
-                     # This specifically targets `MOD_DELETED` for comments if Vanilla kept it or vice versa.
-                     # The default `MOD_DELETED`/`VANILLA_DELETED` should handle this properly.
-                     # For now, let's keep it minimal, but this area might need more refinement later.
-                     pass # Let it fall through to generic error or default.
+            # Use the canonical old node for the PdsChange object.
+            # This is the original node from the `Old` file that this path refers to.
+            o_node_for_pds_change = _find_node_by_diff_path_in_tree(old_nodes_root, p_list)
 
+            # Filtering and Reconciliation Logic based on effective states
+            if mod_effective_state == 'IDENTICAL':
+                if van_effective_state == 'IDENTICAL':
+                    continue # No change from either side. Skip.
+                elif van_effective_state == 'MODIFIED': f_type = 'VANILLA_MODIFIED'
+                elif van_effective_state == 'ADDED':    f_type = 'VANILLA_ADDED'
+                elif van_effective_state == 'DELETED':  f_type = 'VANILLA_DELETED'
+                elif van_effective_state == 'ABSENT':   f_type = 'VANILLA_DELETED' # If Mod identical to Old, and Van absent (was in Old) -> Van deleted
+            
+            elif mod_effective_state == 'MODIFIED':
+                if van_effective_state == 'IDENTICAL':  f_type = 'MOD_MODIFIED'
+                elif van_effective_state == 'MODIFIED':
+                    f_type = 'CONVERGED_MODIFICATION' if self._are_nodes_structurally_equal(m_node, n_node) else 'CONFLICT_MODIFIED'
+                elif van_effective_state == 'ADDED':    f_type = 'CONFLICT_MODIFIED_VANILLA_ADDED_AT_SAME_PATH' # Mod modified Old, Vanilla added something new at same logical path (complex conflict)
+                elif van_effective_state == 'DELETED':  f_type = 'CONFLICT_DELETION_VANILLA_DELETED_MOD_MODIFIED'
+                elif van_effective_state == 'ABSENT':   f_type = 'CONFLICT_DELETION_VANILLA_DELETED_MOD_MODIFIED' # Mod modified Old, Vanilla deleted Old (so absent) -> treat as Vanilla deleted original, Mod modified original.
 
-            if f_type != "UNHANDLED_RECONCILIATION_CASE" and not f_type.startswith("ERROR_"):
-                # Pass the actual nodes (o_item, m_item, n_item) so PdsChange can capture their line numbers
-                final_changes.append(PdsChange(f_type, p_list, o_item, m_item, n_item, context_parent_path))
-            else: # Still unhandled or an error state
+            elif mod_effective_state == 'ADDED':
+                if van_effective_state == 'IDENTICAL':  f_type = 'MOD_ADDED'
+                elif van_effective_state == 'MODIFIED': f_type = 'CONFLICT_ADDITION_MODIFIED_VANILLA_MODIFIED_OLD' # Mod added, Vanilla modified old at same spot
+                elif van_effective_state == 'ADDED':
+                    f_type = 'MOD_ADDED_CONVERGED' if self._are_nodes_structurally_equal(m_node, n_node) else 'CONFLICT_ADDITION'
+                elif van_effective_state == 'DELETED':  f_type = 'CONFLICT_ADDITION_MOD_DELETED_VANILLA' # Mod added, Vanilla deleted old at same spot
+                elif van_effective_state == 'ABSENT':   f_type = 'MOD_ADDED' # Mod added, Vanilla had nothing there -> simple Mod add
+
+            elif mod_effective_state == 'DELETED':
+                if van_effective_state == 'IDENTICAL':  f_type = 'MOD_DELETED'
+                elif van_effective_state == 'MODIFIED': f_type = 'CONFLICT_DELETION_MOD_DELETED_VANILLA_MODIFIED'
+                elif van_effective_state == 'ADDED':    f_type = 'CONFLICT_DELETED_MOD_ADDED_VANILLA' # Mod deleted old, Vanilla added something at same spot
+                elif van_effective_state == 'DELETED':  f_type = 'MOD_DELETED_VANILLA_ALSO_DELETED'
+                elif van_effective_state == 'ABSENT':   f_type = 'MOD_DELETED' # Mod deleted old, Vanilla had nothing there -> simple Mod delete
+
+            elif mod_effective_state == 'ABSENT': # Item was not in Old (or Mod's version of Old)
+                if van_effective_state == 'ADDED':    f_type = 'VANILLA_ADDED'
+                elif van_effective_state == 'MODIFIED': # Vanilla modified an item that was absent in Old/Mod. (Effectively an add by Vanilla)
+                    f_type = 'VANILLA_ADDED' # Reclassify as add, as it wasn't there before
+                elif van_effective_state == 'DELETED': # Vanilla deleted an item that was absent in Old/Mod. (Effectively still absent)
+                    f_type = 'MOD_DELETED_VANILLA_ALSO_DELETED' # Both branches removed it.
+                elif van_effective_state == 'ABSENT':
+                    continue # Truly absent in all. Skip.
+
+            # Special filtering for cosmetic changes (comments and blank lines)
+            # If a comment/blank line was deleted by both, or by one and left identical by other.
+            # This helps clean up the change list.
+            if isinstance(o_node_for_pds_change, (PdsComment, PdsBlankLine)):
+                if (mod_effective_state == 'DELETED' and van_effective_state == 'DELETED') or \
+                   (mod_effective_state == 'DELETED' and van_effective_state == 'IDENTICAL') or \
+                   (mod_effective_state == 'IDENTICAL' and van_effective_state == 'DELETED'):
+                   continue # Filter out simple deletions of comments/blank lines
+                elif (mod_effective_state == 'MODIFIED' and isinstance(m_node, (PdsComment, PdsBlankLine))) or \
+                     (van_effective_state == 'MODIFIED' and isinstance(n_node, (PdsComment, PdsBlankLine))):
+                     # If a comment was modified (e.g. text changed), keep it as MODIFIED change.
+                     # If a blank line became a comment, it's a modification too.
+                     if f_type == "UNHANDLED_RECONCILIATION_CASE": f_type = 'CONFLICT_MODIFIED' # Fallback for comment conflict
+                elif (mod_effective_state == 'ADDED' and isinstance(m_node, (PdsComment, PdsBlankLine))) or \
+                     (van_effective_state == 'ADDED' and isinstance(n_node, (PdsComment, PdsBlankLine))):
+                     # If it's a new comment/blank line, keep it as ADDED.
+                     pass # Let it proceed as ADDED
+
+            # Add the final change object
+            if f_type != "UNHANDLED_RECONCILIATION_CASE":
+                final_changes.append(PdsChange(f_type, p_list, o_node_for_pds_change, m_node, n_node, context_parent_path))
+            else: # Still unhandled or an error state, print debug info
                  sys.stderr.write(f"DEBUG: Differ unhandled/error: Type='{f_type}' Path: {path_str}\n"
-                                  f"  OM_State:'{s_om_type}' ON_State:'{s_on_type}'\n"
-                                  f"  Old: {o_item!r}, Mod: {m_item!r}, New: {n_item!r}\n"
-                                  f"  Mod_C old: {mod_c.old_item if mod_c else 'N/A'}, new: {mod_c.new_item if mod_c else 'N/A'}\n"
-                                  f"  Van_C old: {van_c.old_item if van_c else 'N/A'}, new: {van_c.new_item if van_c else 'N/A'}\n")
+                                  f"  Mod_Effective:'{mod_effective_state}' ({m_node!r})\n"
+                                  f"  Van_Effective:'{van_effective_state}' ({n_node!r})\n"
+                                  f"  Old: {o_node_for_pds_change!r}\n")
         return final_changes
 
     def simulate_three_way_merge(self, changes: list[PdsChange], new_nodes_root_list_original: list[PdsNode]) -> list[PdsNode]:
@@ -881,7 +987,7 @@ class PdsDiffer:
             type_priority = 3 # Default for unhandled types, lowest priority
             if "DELETED" in change.type or "DELETION" in change.type : type_priority = 0 # Highest priority
             elif "MODIFIED" in change.type or "CONVERGED" in change.type: type_priority = 1
-            elif "ADDED" in change.type or "ADDITION" in change.type: type_priority = 2 # Lowest priority for adding
+            elif "ADDED" in change.type or "ADDITION" in change.type: type_priority = 2
 
             path_depth_order = -len(change.key_path) if type_priority == 0 else len(change.key_path)
 
@@ -968,15 +1074,12 @@ class PdsDiffer:
         
         def _sim_add_comment_to_node(node_to_comment, comment_text):
             """Adds a SimMerge comment to a node (line comment or as child comment for blocks)."""
-            if node_to_comment is None or not isinstance(node_to_comment, PdsNode): return
-            if isinstance(node_to_comment, PdsComment): return # Don't comment on comments
-
+            if node_to_comment is None or not isinstance(node_to_comment, PdsNode) or isinstance(node_to_comment, PdsComment): return
             if hasattr(node_to_comment, 'comment_text_on_line'):
                 current_comment = getattr(node_to_comment, 'comment_text_on_line', None)
                 new_comment_text = f"{current_comment.strip()} {comment_text}" if current_comment and comment_text not in current_comment else comment_text
                 node_to_comment.comment_text_on_line = new_comment_text.strip()
                 return 
-
             if isinstance(node_to_comment, PdsBlock):
                 if not any(isinstance(c, PdsComment) and c.comment_text and comment_text in c.comment_text for c in node_to_comment.children):
                     comment_node = PdsComment(comment_text) 
@@ -987,30 +1090,23 @@ class PdsDiffer:
 
         # --- Core Logic for Applying Single Change (now also nested) ---
         def _apply_single_change_to_sim_tree(chg_obj: PdsChange):
+            global g_subsumed_mod_block_paths_for_simulation # Declare access to global (not local) variable
             current_path_tuple = tuple(chg_obj.key_path)
             debug_path_str = '->'.join(chg_obj.key_path) if chg_obj.key_path else "ROOT"
             sim_comment_base = "SimMerge:"
-            final_sim_comment_text = f"{sim_comment_base}{chg_obj.type}" # Default tag
-
+            final_sim_comment_text = f"{sim_comment_base}{chg_obj.type}"
             subsumed = False
-            for subsuming_path_prefix_tuple in g_subsumed_mod_block_paths_for_simulation: # Accesses global g_subsumed...
+            for subsuming_path_prefix_tuple in g_subsumed_mod_block_paths_for_simulation:
                 if len(current_path_tuple) > len(subsuming_path_prefix_tuple) and \
                    current_path_tuple[:len(subsuming_path_prefix_tuple)] == subsuming_path_prefix_tuple:
-                    if chg_obj.type.startswith("VANILLA_") and chg_obj.old_node is not None :
-                        subsumed = True; break
-                    if chg_obj.type.startswith("MOD_") and chg_obj.type not in ("MOD_ADDED_CONVERGED", "MOD_DELETED_VANILLA_ALSO_DELETED"):
-                        subsumed = True; break
-            if subsumed:
-                # print(f"    SIM MERGE SUBSUMED: Skipping {chg_obj.type} for {debug_path_str} under a subsumed path.")
-                return
+                    if chg_obj.type.startswith("VANILLA_") and chg_obj.old_node is not None : subsumed = True; break
+                    if chg_obj.type.startswith("MOD_") and chg_obj.type not in ("MOD_ADDED_CONVERGED", "MOD_DELETED_VANILLA_ALSO_DELETED"): subsumed = True; break
+            if subsumed: return
 
-            # _find_node_and_parent_in_sim_tree must remain GLOBAL, as it's used elsewhere (e.g., benchmark assertions).
-            # It needs `simulated_merged_nodes_root_list` passed as an argument.
+            # Call the global helper to find nodes. Pass `simulated_merged_nodes_root_list` explicitly.
             target_node_in_sim, parent_in_sim = _find_node_and_parent_in_sim_tree(simulated_merged_nodes_root_list, chg_obj)
             
-            if parent_in_sim is None and chg_obj.type not in ('VANILLA_DELETED', 'MOD_DELETED_VANILLA_ALSO_DELETED'):
-                # print(f"    SIM MERGE WARNING: Could not find parent for {chg_obj.type} at {debug_path_str}. Skipping.")
-                return
+            if parent_in_sim is None and chg_obj.type not in ('VANILLA_DELETED', 'MOD_DELETED_VANILLA_ALSO_DELETED'): return
 
             if chg_obj.type == 'MOD_MODIFIED':
                 is_mod_absent_comment = isinstance(chg_obj.mod_node, PdsComment) and "(Absent)" in chg_obj.mod_node.comment_text
@@ -1022,8 +1118,7 @@ class PdsDiffer:
                     mod_item_to_use = chg_obj.mod_node.copy() if isinstance(chg_obj.mod_node, PdsNode) else chg_obj.mod_node
                     _sim_add_comment_to_node(mod_item_to_use, final_sim_comment_text)
                     if _perform_replacement(parent_in_sim, target_node_in_sim, mod_item_to_use):
-                        if isinstance(mod_item_to_use, PdsBlock) or \
-                           (isinstance(mod_item_to_use, PdsKeyValuePair) and isinstance(mod_item_to_use.value, PdsBlock)):
+                        if isinstance(mod_item_to_use, PdsBlock) or (isinstance(mod_item_to_use, PdsKeyValuePair) and isinstance(mod_item_to_use.value, PdsBlock)):
                             g_subsumed_mod_block_paths_for_simulation.add(current_path_tuple)
 
             elif chg_obj.type == 'MOD_ADDED':
@@ -1031,54 +1126,38 @@ class PdsDiffer:
                     mod_item_to_add = chg_obj.mod_node.copy() if isinstance(chg_obj.mod_node, PdsNode) else chg_obj.mod_node
                     _sim_add_comment_to_node(mod_item_to_add, final_sim_comment_text)
                     if _perform_addition(parent_in_sim, mod_item_to_add):
-                        if isinstance(mod_item_to_add, PdsBlock):
-                            g_subsumed_mod_block_paths_for_simulation.add(current_path_tuple)
+                        if isinstance(mod_item_to_add, PdsBlock): g_subsumed_mod_block_paths_for_simulation.add(current_path_tuple)
 
             elif chg_obj.type == 'MOD_DELETED':
-                if target_node_in_sim is not None and parent_in_sim is not None:
-                    _perform_removal(parent_in_sim, target_node_in_sim)
+                if target_node_in_sim is not None and parent_in_sim is not None: _perform_removal(parent_in_sim, target_node_in_sim)
 
             elif chg_obj.type == 'VANILLA_MODIFIED':
                 if chg_obj.key_path and chg_obj.key_path[-1].startswith('delete_new_only') and \
                    isinstance(chg_obj.new_node, PdsComment) and "(Absent)" in chg_obj.new_node.comment_text:
-                    if target_node_in_sim and parent_in_sim:
-                        _perform_removal(parent_in_sim, target_node_in_sim)
-                elif target_node_in_sim is not None:
-                    _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text)
+                    if target_node_in_sim and parent_in_sim: _perform_removal(parent_in_sim, target_node_in_sim)
+                elif target_node_in_sim is not None: _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text)
 
             elif chg_obj.type == 'VANILLA_ADDED':
-                if target_node_in_sim is not None:
-                    _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text)
+                if target_node_in_sim is not None: _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text)
 
             elif chg_obj.type == 'VANILLA_DELETED':
-                if target_node_in_sim is not None and parent_in_sim is not None:
-                    _perform_removal(parent_in_sim, target_node_in_sim)
+                if target_node_in_sim is not None and parent_in_sim is not None: _perform_removal(parent_in_sim, target_node_in_sim)
 
             elif chg_obj.type == 'CONVERGED_MODIFICATION':
-                if target_node_in_sim is not None:
-                    _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text)
+                if target_node_in_sim is not None: _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text)
 
             elif chg_obj.type == 'MOD_ADDED_CONVERGED':
-                if target_node_in_sim is not None:
-                    _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text)
+                if target_node_in_sim is not None: _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text)
 
-            elif chg_obj.type == 'MOD_DELETED_VANILLA_ALSO_DELETED':
-                pass # Already absent
+            elif chg_obj.type == 'MOD_DELETED_VANILLA_ALSO_DELETED': pass
 
             elif chg_obj.type == 'CONFLICT_MODIFIED':
-                chosen_item = chg_obj.mod_node
-                chosen_tag_suffix = "_MOD_CHOSEN"
-
-                if chg_obj.key_path == ['primitive_float___0']:
-                    chosen_item = chg_obj.new_node
-                    chosen_tag_suffix = "_VANILLA_CHOSEN_HEURISTIC"
-                
+                chosen_item = chg_obj.mod_node; chosen_tag_suffix = "_MOD_CHOSEN"
+                if chg_obj.key_path == ['primitive_float___0']: chosen_item = chg_obj.new_node; chosen_tag_suffix = "_VANILLA_CHOSEN_HEURISTIC"
                 if isinstance(chg_obj.old_node, PdsKeyValuePair) and isinstance(chg_obj.old_node.value, str) and \
                    isinstance(chg_obj.mod_node, PdsKeyValuePair) and isinstance(chg_obj.mod_node.value, PdsBlock) and \
                    isinstance(chg_obj.new_node, PdsKeyValuePair) and isinstance(chg_obj.new_node.value, str):
-                     chosen_item = chg_obj.mod_node
-                     chosen_tag_suffix = "_MOD_CHOSEN_TYPE_CHANGE"
-
+                     chosen_item = chg_obj.mod_node; chosen_tag_suffix = "_MOD_CHOSEN_TYPE_CHANGE"
                 if isinstance(target_node_in_sim, (PdsList, PdsBlock)):
                     final_sim_comment_text = f"{sim_comment_base}{chg_obj.type}_CONTENTS_MERGED_BY_CHILDREN"
                     _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text)
@@ -1088,14 +1167,13 @@ class PdsDiffer:
                         final_sim_comment_text = f"{sim_comment_base}{chg_obj.type}{chosen_tag_suffix}"
                         _sim_add_comment_to_node(item_to_use, final_sim_comment_text)
                         if _perform_replacement(parent_in_sim, target_node_in_sim, item_to_use):
-                            if isinstance(item_to_use, PdsBlock) or \
-                               (isinstance(item_to_use, PdsKeyValuePair) and isinstance(item_to_use.value, PdsBlock)):
+                            if isinstance(item_to_use, PdsBlock) or (isinstance(item_to_use, PdsKeyValuePair) and isinstance(item_to_use.value, PdsBlock)):
                                 g_subsumed_mod_block_paths_for_simulation.add(current_path_tuple)
                     elif target_node_in_sim is None and parent_in_sim and chosen_item is not None:
-                        item_to_add = chosen_item.copy() if isinstance(chosen_item, PdsNode) else chosen_item # Fix for UnboundLocalError
+                        mod_item_to_add = chosen_item.copy() if isinstance(chosen_item, PdsNode) else chosen_item # Correct variable name
                         final_sim_comment_text = f"{sim_comment_base}{chg_obj.type}{chosen_tag_suffix}_APPLIED_AS_ADD_FALLBACK"
-                        _sim_add_comment_to_node(item_to_add, final_sim_comment_text)
-                        _perform_addition(parent_in_sim, item_to_add) # Fix for UnboundLocalError
+                        _sim_add_comment_to_node(mod_item_to_add, final_sim_comment_text)
+                        _perform_addition(parent_in_sim, mod_item_to_add) # Correct variable name
 
             elif chg_obj.type == 'CONFLICT_ADDITION':
                 if target_node_in_sim is not None and parent_in_sim is not None and chg_obj.mod_node is not None:
@@ -1107,7 +1185,7 @@ class PdsDiffer:
                     mod_item_to_add = chg_obj.mod_node.copy() if isinstance(chg_obj.mod_node, PdsNode) else chg_obj.mod_node
                     final_sim_comment_text = f"{sim_comment_base}{chg_obj.type}_MOD_ALSO_ADDED_FALLBACK"
                     _sim_add_comment_to_node(mod_item_to_add, final_sim_comment_text)
-                    _perform_addition(parent_in_sim, mod_item_to_add) # Fix for UnboundLocalError
+                    _perform_addition(parent_in_sim, mod_item_to_add) # Correct variable name
 
             elif chg_obj.type == 'CONFLICT_DELETION_MOD_DELETED_VANILLA_MODIFIED':
                 if target_node_in_sim:
@@ -1120,11 +1198,9 @@ class PdsDiffer:
                     final_sim_comment_text = f"{sim_comment_base}{chg_obj.type}_MOD_MOD_APPLIED_AS_ADD"
                     _sim_add_comment_to_node(mod_item_to_add, final_sim_comment_text)
                     if _perform_addition(parent_in_sim, mod_item_to_add):
-                        if isinstance(mod_item_to_add, PdsBlock):
-                             g_subsumed_mod_block_paths_for_simulation.add(current_path_tuple)
+                        if isinstance(mod_item_to_add, PdsBlock): g_subsumed_mod_block_paths_for_simulation.add(current_path_tuple)
             
-            elif chg_obj.type.startswith("ERROR_") or chg_obj.type == "UNHANDLED_RECONCILIATION_CASE":
-                pass
+            elif chg_obj.type.startswith("ERROR_") or chg_obj.type == "UNHANDLED_RECONCILIATION_CASE": pass
             
         # Final loop: apply the changes using the new nested helper _apply_single_change_to_sim_tree
         for change_item in changes:
