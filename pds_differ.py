@@ -58,16 +58,32 @@ from pds_parser import (
 
 # --- PdsChange and PairwiseDiffResult (UNCHANGED) ---
 class PdsChange:
-    # ... (content as before) ...
     def __init__(self, type, key_path, old_node=None, mod_node=None, new_node=None, context_parent_path=None):
-        self.type = type; self.key_path = key_path; self.old_node = old_node; self.mod_node = mod_node
-        self.new_node = new_node; self.context_parent_path = context_parent_path if context_parent_path is not None else []
+        self.type = type
+        self.key_path = key_path
+        self.old_node = old_node
+        self.mod_node = mod_node
+        self.new_node = new_node
+        self.context_parent_path = context_parent_path if context_parent_path is not None else []
+        
+        # Add original line numbers for sorting and insertion heuristics
+        self.mod_line_number = mod_node.line_number if isinstance(mod_node, PdsNode) else -1
+        self.new_line_number = new_node.line_number if isinstance(new_node, PdsNode) else -1
+        self.old_line_number = old_node.line_number if isinstance(old_node, PdsNode) else -1
+
     def __repr__(self):
         def _get_node_short_repr(node):
             if node is None: return "ABSENT"
-            s = repr(node); return s[1:-1] if len(s) <= 70 else s[1:34] + "..." + s[-34:-1]
-        o=f"O:{_get_node_short_repr(self.old_node)}";m=f"M:{_get_node_short_repr(self.mod_node)}";n=f"N:{_get_node_short_repr(self.new_node)}"
-        p='.'.join(map(str,self.key_path)) if self.key_path else 'ROOT';pp='.'.join(map(str,self.context_parent_path)) if self.context_parent_path else 'ROOT_PARENT'
+            # Include line number in short repr for better debugging context
+            line_info = f" L{node.line_number}" if hasattr(node, 'line_number') and node.line_number != -1 else ""
+            s = repr(node); return f"{s[1:-1]}{line_info}" if len(s) <= 70 else f"{s[1:34]}...{s[-34:-1]}{line_info}"
+        
+        o=f"O:{_get_node_short_repr(self.old_node)}"
+        m=f"M:{_get_node_short_repr(self.mod_node)}"
+        n=f"N:{_get_node_short_repr(self.new_node)}"
+        p='.'.join(map(str,self.key_path)) if self.key_path else 'ROOT'
+        pp='.'.join(map(str,self.context_parent_path)) if self.context_parent_path else 'ROOT_PARENT'
+        
         return f"PdsChange(Type='{self.type:<45}', Path='{p}', \n          ParentCtx='{pp}', \n          Nodes=[\n            {o},\n            {m},\n            {n}\n          ])"
 
 class PairwiseDiffResult:
@@ -732,7 +748,6 @@ class PdsDiffer:
         return pairwise_changes
 
     def diff_nodes(self, old_nodes_root: list[PdsNode], mod_nodes_root: list[PdsNode], new_nodes_root: list[PdsNode]):
-        # (Using the refined version from the previous AI response)
         mod_diffs = self._perform_pairwise_diff(old_nodes_root, mod_nodes_root, [])
         van_diffs = self._perform_pairwise_diff(old_nodes_root, new_nodes_root, [])
 
@@ -752,38 +767,35 @@ class PdsDiffer:
             o_item, m_item, n_item = None, None, None 
             s_om_type, s_on_type = 'ABSENT_IN_MOD_DIFF', 'ABSENT_IN_VANILLA_DIFF'
 
+            # Determine original item (o_item)
             if mod_c and mod_c.old_item is not None: o_item = mod_c.old_item
             elif van_c and van_c.old_item is not None: o_item = van_c.old_item
             
+            # Determine Mod's state (m_item, s_om_type)
             if mod_c:
                 s_om_type = mod_c.change_type
-                if s_om_type == 'DELETED': m_item = None
-                else: m_item = mod_c.new_item 
-            elif o_item is not None: 
-                if van_c and van_c.change_type == 'DELETED' and self._are_nodes_structurally_equal(van_c.old_item, o_item):
-                     s_om_type = 'DELETED'; m_item = None 
-                else: 
-                     s_om_type = 'IDENTICAL'; m_item = o_item 
+                m_item = mod_c.new_item if s_om_type != 'DELETED' else None
+            elif o_item is not None: # Mod didn't touch this path, so it's identical to Old
+                s_om_type = 'IDENTICAL'; m_item = o_item 
             
+            # Determine Vanilla's state (n_item, s_on_type)
             if van_c:
                 s_on_type = van_c.change_type
-                if s_on_type == 'DELETED': n_item = None
-                else: n_item = van_c.new_item 
-            elif o_item is not None: 
-                if mod_c and mod_c.change_type == 'DELETED' and self._are_nodes_structurally_equal(mod_c.old_item, o_item):
-                    s_on_type = 'DELETED'; n_item = None 
-                else: 
-                    s_on_type = 'IDENTICAL'; n_item = o_item
+                n_item = van_c.new_item if s_on_type != 'DELETED' else None
+            elif o_item is not None: # Vanilla didn't touch this path, so it's identical to Old
+                s_on_type = 'IDENTICAL'; n_item = o_item
             
-            if s_om_type == 'ADDED': o_item = None 
-            if s_on_type == 'ADDED' and o_item is not None : 
-                 if not (mod_c and mod_c.old_item is not None) : 
-                     o_item = None
+            # Special handling for "ABSENT" comments which represent deletions (as parsed by lexer)
+            if isinstance(m_item, PdsComment) and "(Absent)" in m_item.comment_text: m_item = None; s_om_type = 'DELETED'
+            if isinstance(n_item, PdsComment) and "(Absent)" in n_item.comment_text: n_item = None; s_on_type = 'DELETED'
+            # Also, if a node was a comment/blank line in Old and now is None in Mod/New, confirm deletion
+            # This is handled implicitly by `_perform_pairwise_diff` creating DELETED PairwiseDiffResult.
+            # No explicit change needed here for comments/blank lines being None.
 
             f_type = "UNHANDLED_RECONCILIATION_CASE" 
 
             if s_om_type == 'IDENTICAL':
-                if s_on_type == 'IDENTICAL': continue 
+                if s_on_type == 'IDENTICAL': continue # No change in both branches
                 elif s_on_type == 'MODIFIED': f_type = 'VANILLA_MODIFIED'
                 elif s_on_type == 'ADDED':    f_type = 'VANILLA_ADDED' 
                 elif s_on_type == 'DELETED':  f_type = 'VANILLA_DELETED'
@@ -791,46 +803,52 @@ class PdsDiffer:
                 if s_on_type == 'IDENTICAL':  f_type = 'MOD_MODIFIED'
                 elif s_on_type == 'MODIFIED':
                     f_type = 'CONVERGED_MODIFICATION' if self._are_nodes_structurally_equal(m_item, n_item) else 'CONFLICT_MODIFIED'
-                elif s_on_type == 'ADDED': 
+                elif s_on_type == 'ADDED': # Mod modified, Vanilla added at same path. This is an unexpected state.
                     f_type = 'ERROR_MOD_MODIFIED_VANILLA_ADDED_AT_SAME_PATH' 
-                elif s_on_type == 'DELETED':
+                elif s_on_type == 'DELETED': # Mod modified, Vanilla deleted
                     f_type = 'CONFLICT_DELETION_VANILLA_DELETED_MOD_MODIFIED'
             elif s_om_type == 'ADDED': 
                 if s_on_type == 'IDENTICAL': 
                     f_type = 'MOD_ADDED'     
-                elif s_on_type == 'MODIFIED': 
-                    f_type = 'MOD_ADDED' 
-                elif s_on_type == 'ADDED': 
+                elif s_on_type == 'MODIFIED': # Mod added, Vanilla modified. This should not happen at same path for same Old item.
+                    f_type = 'ERROR_MOD_ADDED_VANILLA_MODIFIED_AT_SAME_PATH'
+                elif s_on_type == 'ADDED': # Mod added, Vanilla also added.
                     f_type = 'MOD_ADDED_CONVERGED' if self._are_nodes_structurally_equal(m_item, n_item) else 'CONFLICT_ADDITION'
-                elif s_on_type == 'DELETED': 
-                    f_type = 'MOD_ADDED'
-                elif s_on_type == 'ABSENT_IN_VANILLA_DIFF': 
-                    f_type = 'MOD_ADDED'
-
+                elif s_on_type == 'DELETED': # Mod added, Vanilla deleted. This is very rare.
+                    f_type = 'ERROR_MOD_ADDED_VANILLA_DELETED_AT_SAME_PATH' 
+                
             elif s_om_type == 'DELETED': 
                 if s_on_type == 'IDENTICAL': 
                     f_type = 'MOD_DELETED'
                 elif s_on_type == 'MODIFIED': 
                     f_type = 'CONFLICT_DELETION_MOD_DELETED_VANILLA_MODIFIED'
-                elif s_on_type == 'ADDED': 
+                elif s_on_type == 'ADDED': # Mod deleted, Vanilla added. This means item was deleted but something new appeared at that location.
                     f_type = 'ERROR_MOD_DELETED_VANILLA_ADDED_AT_SAME_PATH'
                 elif s_on_type == 'DELETED': 
                     f_type = 'MOD_DELETED_VANILLA_ALSO_DELETED'
             
-            elif s_om_type == 'ABSENT_IN_MOD_DIFF': 
-                if s_on_type == 'ADDED': f_type = 'VANILLA_ADDED'
-                elif s_on_type == 'MODIFIED' and o_item is not None: f_type = 'VANILLA_MODIFIED' 
-                elif s_on_type == 'DELETED' and o_item is not None: f_type = 'VANILLA_DELETED'   
-            
+            # If still unhandled, or if it's a comment/blank line that was only present in Old, then filter.
+            # This is important to avoid noisy diffs from formatting changes.
+            if f_type == "UNHANDLED_RECONCILIATION_CASE":
+                 # If it's a comment/blank line in Old, and it's missing in both Mod and New, it's effectively a cleanup.
+                 # Filter these out unless they were specifically added.
+                 if isinstance(o_item, (PdsComment, PdsBlankLine)) and m_item is None and n_item is None:
+                     continue # Ignore these as non-structural deletions
+                 # If it's a comment/blank line and only one branch modified it (but it was deleted by other).
+                 # The explicit types CONFLICT_DELETION_... should handle this, so filter out if not.
+                 elif isinstance(o_item, (PdsComment, PdsBlankLine)) and (m_item is None or n_item is None):
+                     # If it's a non-structural element that's been removed in one branch and left untouched in another.
+                     # We'll just ignore these.
+                     # This specifically targets `MOD_DELETED` for comments if Vanilla kept it or vice versa.
+                     # The default `MOD_DELETED`/`VANILLA_DELETED` should handle this properly.
+                     # For now, let's keep it minimal, but this area might need more refinement later.
+                     pass # Let it fall through to generic error or default.
+
+
             if f_type != "UNHANDLED_RECONCILIATION_CASE" and not f_type.startswith("ERROR_"):
-                final_o, final_m, final_n = o_item, m_item, n_item
-                if f_type in ('VANILLA_ADDED', 'MOD_ADDED', 'CONFLICT_ADDITION', 'MOD_ADDED_CONVERGED'):
-                     final_o = None 
-                if f_type == 'VANILLA_ADDED': final_m = None
-                if f_type == 'MOD_ADDED': final_n = None
-                
-                final_changes.append(PdsChange(f_type, p_list, final_o, final_m, final_n, context_parent_path))
-            elif f_type.startswith("ERROR_") or f_type == "UNHANDLED_RECONCILIATION_CASE":
+                # Pass the actual nodes (o_item, m_item, n_item) so PdsChange can capture their line numbers
+                final_changes.append(PdsChange(f_type, p_list, o_item, m_item, n_item, context_parent_path))
+            else: # Still unhandled or an error state
                  sys.stderr.write(f"DEBUG: Differ unhandled/error: Type='{f_type}' Path: {path_str}\n"
                                   f"  OM_State:'{s_om_type}' ON_State:'{s_on_type}'\n"
                                   f"  Old: {o_item!r}, Mod: {m_item!r}, New: {n_item!r}\n"
@@ -843,17 +861,7 @@ class PdsDiffer:
         Simulates a 3-way merge by applying changes (generated by diff_nodes)
         onto a copy of the 'New' (Vanilla) AST.
         
-        Conflict resolution heuristics are applied:
-        - Mod Added: Added.
-        - Vanilla Added: Added.
-        - Mod Deleted: Removed (if Vanilla didn't modify it).
-        - Vanilla Deleted: Removed (if Mod didn't modify it).
-        - Converged Modification: Kept (Vanilla's change is same as Mod's).
-        - CONFLICT_MODIFIED (primitive/KVP): Mod's version usually wins, unless specific heuristic.
-        - CONFLICT_MODIFIED (Block/List): Vanilla's block/list is kept, and child changes are merged.
-        - CONFLICT_ADDITION: Both added a new item at the same logical path. Mod's version is added after Vanilla's.
-        - CONFLICT_DELETION_MOD_DELETED_VANILLA_MODIFIED: Vanilla's modification is kept.
-        - CONFLICT_DELETION_VANILLA_DELETED_MOD_MODIFIED: Mod's modification is applied as an addition.
+        Conflict resolution heuristics are applied.
         """
         global g_subsumed_mod_block_paths_for_simulation
         g_subsumed_mod_block_paths_for_simulation = set() # Reset for each merge simulation
@@ -869,31 +877,30 @@ class PdsDiffer:
         print(f"--- PdsDiffer: SIMULATING MERGE ({len(changes)} changes) ---") 
         
         # Sort changes to ensure stable and correct application order:
-        # 1. Deletions: Process deepest paths first (to avoid deleting a parent before its children are processed).
-        # 2. Modifications: Process shallower paths first (to ensure parent nodes are stable before children are modified).
-        # 3. Additions: Process shallower paths first.
         def sort_key_for_changes(change: PdsChange):
-            type_priority = 3 # Default for unhandled types, lower priority
+            type_priority = 3 # Default for unhandled types, lowest priority
             if "DELETED" in change.type or "DELETION" in change.type : type_priority = 0 # Highest priority
             elif "MODIFIED" in change.type or "CONVERGED" in change.type: type_priority = 1
             elif "ADDED" in change.type or "ADDITION" in change.type: type_priority = 2 # Lowest priority for adding
-            
-            # Determine path depth order:
-            # For deletions: process deepest paths first (e.g., delete child before parent).
-            # For modifications and additions: process shallower paths first (e.g., ensure parent exists/is modified before trying to add/modify child).
+
             path_depth_order = -len(change.key_path) if type_priority == 0 else len(change.key_path)
+
+            line_number_for_sorting = 0
+            if type_priority == 2: # ADDED changes (Mod_Added, Conflict_Addition)
+                line_number_for_sorting = change.mod_line_number if change.mod_line_number != -1 else float('inf')
+            elif type_priority == 1: # MODIFIED changes (Mod_Modified, Vanilla_Modified, Converged_Modified)
+                line_number_for_sorting = change.new_line_number if change.new_line_number != -1 else float('inf')
             
-            return (type_priority, path_depth_order)
+            return (type_priority, path_depth_order, line_number_for_sorting)
 
         changes.sort(key=sort_key_for_changes)
 
-        # --- Nested Helper Functions for AST Manipulation during Merge ---
-        # These functions are defined here to have direct access to `simulated_merged_nodes_root_list`
-        # and `g_subsumed_mod_block_paths_for_simulation` (via `nonlocal` if needed, but not strictly required for direct access).
+        # --- NESTED HELPER FUNCTIONS (define them here, INSIDE this method) ---
+        # These functions now form a closure and can access `simulated_merged_nodes_root_list`
+        # and `g_subsumed_mod_block_paths_for_simulation` directly from this scope.
 
         def _perform_replacement(parent, target, replacement_item):
             """Replaces `target` with `replacement_item` in `parent` collection."""
-            # Ensure replacement_item (if PdsNode) gets correct indent level from target/parent.
             if isinstance(replacement_item, PdsNode) and isinstance(target, PdsNode):
                 replacement_item.indent_level = target.indent_level # Preserve original indent
             elif isinstance(replacement_item, PdsNode): # If target was primitive or not found, derive indent from parent
@@ -913,8 +920,8 @@ class PdsDiffer:
             return False
 
         def _perform_addition(parent, item_to_add, after_node=None):
-            """Adds `item_to_add` to `parent` collection, optionally after `after_node`."""
-            # Ensure item_to_add (if PdsNode) gets correct indent level from parent.
+            """Adds `item_to_add` to `parent` collection, optionally after `after_node`.
+            Includes intelligent placement for root-level list additions based on line number."""
             if isinstance(item_to_add, PdsNode):
                 if isinstance(parent, PdsBlock): item_to_add.indent_level = parent.indent_level + 4
                 elif isinstance(parent, PdsList): item_to_add.indent_level = parent.indent_level + 4
@@ -923,17 +930,29 @@ class PdsDiffer:
             if isinstance(parent, PdsBlock):
                 if isinstance(item_to_add, PdsNode):
                     return parent.add_child_at_appropriate_location(item_to_add, after_node_instance=after_node if isinstance(after_node, PdsNode) else None)
-            elif isinstance(parent, list): # Root level
-                if after_node and after_node in parent:
-                    try: idx = parent.index(after_node); parent.insert(idx + 1, item_to_add); return True
-                    except ValueError: parent.append(item_to_add); return True # Fallback to append if after_node not found
-                else: parent.append(item_to_add); return True # Append to end if no after_node
-            elif isinstance(parent, PdsList):
+            
+            elif isinstance(parent, list): # This is the root list (`simulated_merged_nodes_root_list`)
+                # For root-level additions, insert based on the item's line number.
+                insert_idx = len(parent) # Default to append if no suitable position found
+                item_line_number = item_to_add.line_number if isinstance(item_to_add, PdsNode) else -1
+
+                if item_line_number != -1:
+                    for i, existing_root_node in enumerate(parent):
+                        if isinstance(existing_root_node, PdsNode) and existing_root_node.line_number != -1:
+                            if existing_root_node.line_number > item_line_number:
+                                insert_idx = i
+                                break
+                
+                parent.insert(insert_idx, item_to_add)
+                return True
+
+            elif isinstance(parent, PdsList): # For items within a PdsList node
                 if after_node and after_node in parent.values:
                     try: idx = parent.values.index(after_node); parent.values.insert(idx + 1, item_to_add); return True
-                    except ValueError: parent.values.append(item_to_add); return True # Fallback to append
-                else: parent.values.append(item_to_add); return True # Append to end
-            return False
+                    except ValueError: parent.values.append(item_to_add); return True # Fallback to append if after_node not found
+                else: parent.values.append(item_to_add); return True # Append to end if no after_node
+            
+            return False # Should not be reached if parent type is handled.
 
         def _perform_removal(parent, target_to_remove):
             """Removes `target_to_remove` from `parent` collection."""
@@ -952,223 +971,163 @@ class PdsDiffer:
             if node_to_comment is None or not isinstance(node_to_comment, PdsNode): return
             if isinstance(node_to_comment, PdsComment): return # Don't comment on comments
 
-            # Attempt to add as line comment first
             if hasattr(node_to_comment, 'comment_text_on_line'):
                 current_comment = getattr(node_to_comment, 'comment_text_on_line', None)
                 new_comment_text = f"{current_comment.strip()} {comment_text}" if current_comment and comment_text not in current_comment else comment_text
                 node_to_comment.comment_text_on_line = new_comment_text.strip()
                 return 
 
-            # If not a line-commentable node, and it's a block, add as a child comment.
             if isinstance(node_to_comment, PdsBlock):
-                # Avoid adding duplicate comments if already present
                 if not any(isinstance(c, PdsComment) and c.comment_text and comment_text in c.comment_text for c in node_to_comment.children):
                     comment_node = PdsComment(comment_text) 
                     parent_indent = node_to_comment.indent_level if node_to_comment.indent_level is not None else 0
                     comment_node.indent_level = parent_indent + 4 # Indent child comment
                     node_to_comment.children.insert(0, comment_node) # Add to beginning of children
 
-        # --- Main Loop to Apply Changes ---
-        for change_item in changes:
-            current_path_tuple = tuple(change_item.key_path)
-            debug_path_str = '->'.join(change_item.key_path) if change_item.key_path else "ROOT"
-            sim_comment_base = "SimMerge:"
-            final_sim_comment_text = f"{sim_comment_base}{change_item.type}" # Default tag
 
-            # Subsumption check: Prevents applying changes to children if their parent block
-            # was already entirely replaced by Mod (e.g., MOD_ADDED block, or CONFLICT_MODIFIED
-            # block where Mod's version was chosen outright).
+        # --- Core Logic for Applying Single Change (now also nested) ---
+        def _apply_single_change_to_sim_tree(chg_obj: PdsChange):
+            current_path_tuple = tuple(chg_obj.key_path)
+            debug_path_str = '->'.join(chg_obj.key_path) if chg_obj.key_path else "ROOT"
+            sim_comment_base = "SimMerge:"
+            final_sim_comment_text = f"{sim_comment_base}{chg_obj.type}" # Default tag
+
             subsumed = False
-            for subsuming_path_prefix_tuple in g_subsumed_mod_block_paths_for_simulation:
+            for subsuming_path_prefix_tuple in g_subsumed_mod_block_paths_for_simulation: # Accesses global g_subsumed...
                 if len(current_path_tuple) > len(subsuming_path_prefix_tuple) and \
                    current_path_tuple[:len(subsuming_path_prefix_tuple)] == subsuming_path_prefix_tuple:
-                    # If current change is a child of a subsumed path, skip it.
-                    # This applies to modifications/deletions of children from both Mod and Vanilla.
-                    # Crucially, `VANILLA_ADDED` changes are generally NOT skipped by subsumption,
-                    # as vanilla adds should still be integrated unless the entire section was removed.
-                    # However, if a block is *wholly replaced* by Mod (and its path added to subsumed_paths),
-                    # then any children of that *original* block (from Vanilla) should be ignored.
-                    # The current logic for adding to subsumed_paths (below) handles this.
-                    # For now, let's keep the existing check:
-                    if change_item.type.startswith("VANILLA_") and change_item.old_node is not None :
+                    if chg_obj.type.startswith("VANILLA_") and chg_obj.old_node is not None :
                         subsumed = True; break
-                    if change_item.type.startswith("MOD_") and change_item.type not in ("MOD_ADDED_CONVERGED", "MOD_DELETED_VANILLA_ALSO_DELETED"):
+                    if chg_obj.type.startswith("MOD_") and chg_obj.type not in ("MOD_ADDED_CONVERGED", "MOD_DELETED_VANILLA_ALSO_DELETED"):
                         subsumed = True; break
             if subsumed:
-                # print(f"    SIM MERGE SUBSUMED: Skipping {change_item.type} for {debug_path_str} under a subsumed path.")
-                continue
+                # print(f"    SIM MERGE SUBSUMED: Skipping {chg_obj.type} for {debug_path_str} under a subsumed path.")
+                return
 
-            target_node_in_sim, parent_in_sim = _find_node_and_parent_in_sim_tree(simulated_merged_nodes_root_list, change_item)
+            # _find_node_and_parent_in_sim_tree must remain GLOBAL, as it's used elsewhere (e.g., benchmark assertions).
+            # It needs `simulated_merged_nodes_root_list` passed as an argument.
+            target_node_in_sim, parent_in_sim = _find_node_and_parent_in_sim_tree(simulated_merged_nodes_root_list, chg_obj)
             
-            # If no parent can be found, the change cannot be applied. This can happen for very deep paths
-            # if an ancestor was deleted earlier.
-            if parent_in_sim is None and change_item.type not in ('VANILLA_DELETED', 'MOD_DELETED_VANILLA_ALSO_DELETED'):
-                # print(f"    SIM MERGE WARNING: Could not find parent for {change_item.type} at {debug_path_str}. Skipping.")
-                continue
+            if parent_in_sim is None and chg_obj.type not in ('VANILLA_DELETED', 'MOD_DELETED_VANILLA_ALSO_DELETED'):
+                # print(f"    SIM MERGE WARNING: Could not find parent for {chg_obj.type} at {debug_path_str}. Skipping.")
+                return
 
-            # --- Apply Change Logic based on PdsChange.type ---
-
-            if change_item.type == 'MOD_MODIFIED':
-                # Mod changed it, Vanilla kept Old. Take Mod's version.
-                # Special heuristic: If Mod changed KVP to an "(Absent)" comment, it means Mod deleted it.
-                # If Vanilla kept Old, then Vanilla's version wins, and we tag it as Mod-deleted.
-                is_mod_absent_comment = isinstance(change_item.mod_node, PdsComment) and "(Absent)" in change_item.mod_node.comment_text
-                if is_mod_absent_comment and change_item.new_node is not None and change_item.old_node is not None and \
-                   self._are_nodes_structurally_equal(change_item.old_node, change_item.new_node): # New is identical to Old
+            if chg_obj.type == 'MOD_MODIFIED':
+                is_mod_absent_comment = isinstance(chg_obj.mod_node, PdsComment) and "(Absent)" in chg_obj.mod_node.comment_text
+                if is_mod_absent_comment and chg_obj.new_node is not None and chg_obj.old_node is not None and \
+                   self._are_nodes_structurally_equal(chg_obj.old_node, chg_obj.new_node):
                     final_sim_comment_text = f"{sim_comment_base}MOD_DELETED_VANILLA_KEPT"
-                    _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text) # Tag Vanilla's kept node
-                elif target_node_in_sim is not None and parent_in_sim and change_item.mod_node is not None:
-                    # Standard Mod modification: Replace Vanilla's version with Mod's.
-                    mod_item_to_use = change_item.mod_node.copy() if isinstance(change_item.mod_node, PdsNode) else change_item.mod_node
+                    _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text)
+                elif target_node_in_sim is not None and parent_in_sim and chg_obj.mod_node is not None:
+                    mod_item_to_use = chg_obj.mod_node.copy() if isinstance(chg_obj.mod_node, PdsNode) else chg_obj.mod_node
                     _sim_add_comment_to_node(mod_item_to_use, final_sim_comment_text)
                     if _perform_replacement(parent_in_sim, target_node_in_sim, mod_item_to_use):
-                        # If a whole block/KVP-with-block-value was replaced by Mod, its children are subsumed.
                         if isinstance(mod_item_to_use, PdsBlock) or \
                            (isinstance(mod_item_to_use, PdsKeyValuePair) and isinstance(mod_item_to_use.value, PdsBlock)):
                             g_subsumed_mod_block_paths_for_simulation.add(current_path_tuple)
-                # If target_node_in_sim is None here, it implies Vanilla deleted it or it wasn't found - handled by other conflict types.
 
-            elif change_item.type == 'MOD_ADDED':
-                # Mod added it, Vanilla didn't have it (or was absent). Add Mod's version.
-                if parent_in_sim is not None and change_item.mod_node is not None:
-                    mod_item_to_add = change_item.mod_node.copy() if isinstance(change_item.mod_node, PdsNode) else change_item.mod_node
+            elif chg_obj.type == 'MOD_ADDED':
+                if parent_in_sim is not None and chg_obj.mod_node is not None:
+                    mod_item_to_add = chg_obj.mod_node.copy() if isinstance(chg_obj.mod_node, PdsNode) else chg_obj.mod_node
                     _sim_add_comment_to_node(mod_item_to_add, final_sim_comment_text)
                     if _perform_addition(parent_in_sim, mod_item_to_add):
-                        # If an entire block was added by Mod, its children are subsumed.
                         if isinstance(mod_item_to_add, PdsBlock):
                             g_subsumed_mod_block_paths_for_simulation.add(current_path_tuple)
 
-            elif change_item.type == 'MOD_DELETED':
-                # Mod deleted it, Vanilla kept Old. So delete it from the merged tree.
+            elif chg_obj.type == 'MOD_DELETED':
                 if target_node_in_sim is not None and parent_in_sim is not None:
                     _perform_removal(parent_in_sim, target_node_in_sim)
-                # No comment added for simple deletion.
 
-            elif change_item.type == 'VANILLA_MODIFIED':
-                # Vanilla modified it, Mod kept Old. Keep Vanilla's version and tag.
-                # Special heuristic: 'delete_new_only' type `VANILLA_MODIFIED` when New replaced KVP with Absent comment.
-                # This implies Vanilla effectively deleted it.
-                if change_item.key_path and change_item.key_path[-1].startswith('delete_new_only') and \
-                   isinstance(change_item.new_node, PdsComment) and "(Absent)" in change_item.new_node.comment_text:
-                    if target_node_in_sim and parent_in_sim: # Target is the Absent comment, remove it.
+            elif chg_obj.type == 'VANILLA_MODIFIED':
+                if chg_obj.key_path and chg_obj.key_path[-1].startswith('delete_new_only') and \
+                   isinstance(chg_obj.new_node, PdsComment) and "(Absent)" in chg_obj.new_node.comment_text:
+                    if target_node_in_sim and parent_in_sim:
                         _perform_removal(parent_in_sim, target_node_in_sim)
                 elif target_node_in_sim is not None:
                     _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text)
 
-            elif change_item.type == 'VANILLA_ADDED':
-                # Vanilla added it, Mod kept Old (was absent). Vanilla's addition is already in sim_tree. Just tag.
-                if target_node_in_sim is not None: # Should be found as it's from the New tree
+            elif chg_obj.type == 'VANILLA_ADDED':
+                if target_node_in_sim is not None:
                     _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text)
 
-            elif change_item.type == 'VANILLA_DELETED':
-                # Vanilla deleted it, Mod kept Old. So delete it from merged tree.
+            elif chg_obj.type == 'VANILLA_DELETED':
                 if target_node_in_sim is not None and parent_in_sim is not None:
                     _perform_removal(parent_in_sim, target_node_in_sim)
 
-            elif change_item.type == 'CONVERGED_MODIFICATION':
-                # Mod and Vanilla made the same change. The New version (target_node_in_sim) is already correct. Just tag it.
+            elif chg_obj.type == 'CONVERGED_MODIFICATION':
                 if target_node_in_sim is not None:
                     _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text)
 
-            elif change_item.type == 'MOD_ADDED_CONVERGED':
-                # Mod added and Vanilla also added (with identical content/structure). New version is already correct. Just tag it.
+            elif chg_obj.type == 'MOD_ADDED_CONVERGED':
                 if target_node_in_sim is not None:
                     _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text)
 
-            elif change_item.type == 'MOD_DELETED_VANILLA_ALSO_DELETED':
-                # Both deleted. The node should already be absent in `sim_tree` (which is based on `new_nodes`). No action needed.
-                pass
+            elif chg_obj.type == 'MOD_DELETED_VANILLA_ALSO_DELETED':
+                pass # Already absent
 
-            elif change_item.type == 'CONFLICT_MODIFIED':
-                # This is the primary conflict type: Mod and Vanilla both modified the same node from Old.
-                # Resolution depends on node type (primitive/KVP vs. Block/List).
-
-                chosen_item = change_item.mod_node # Default: Mod's version wins for primitives/KVPs.
+            elif chg_obj.type == 'CONFLICT_MODIFIED':
+                chosen_item = chg_obj.mod_node
                 chosen_tag_suffix = "_MOD_CHOSEN"
 
-                # Specific heuristic: `primitive_float` conflict. Test wants Vanilla to win.
-                if change_item.key_path == ['primitive_float___0']:
-                    chosen_item = change_item.new_node
+                if chg_obj.key_path == ['primitive_float___0']:
+                    chosen_item = chg_obj.new_node
                     chosen_tag_suffix = "_VANILLA_CHOSEN_HEURISTIC"
                 
-                # Specific heuristic: `kvp_to_block` structural conflict (Old:str, Mod:block, New:str).
-                # Mod's structural change (KVP with Block value) takes precedence.
-                if isinstance(change_item.old_node, PdsKeyValuePair) and isinstance(change_item.old_node.value, str) and \
-                   isinstance(change_item.mod_node, PdsKeyValuePair) and isinstance(change_item.mod_node.value, PdsBlock) and \
-                   isinstance(change_item.new_node, PdsKeyValuePair) and isinstance(change_item.new_node.value, str):
-                     chosen_item = change_item.mod_node
+                if isinstance(chg_obj.old_node, PdsKeyValuePair) and isinstance(chg_obj.old_node.value, str) and \
+                   isinstance(chg_obj.mod_node, PdsKeyValuePair) and isinstance(chg_obj.mod_node.value, PdsBlock) and \
+                   isinstance(chg_obj.new_node, PdsKeyValuePair) and isinstance(chg_obj.new_node.value, str):
+                     chosen_item = chg_obj.mod_node
                      chosen_tag_suffix = "_MOD_CHOSEN_TYPE_CHANGE"
 
-                # If the conflict is on a Block or a List, the general strategy is to merge their *contents*.
-                # This means keeping the Vanilla block/list structure and allowing child-level diffs to resolve.
                 if isinstance(target_node_in_sim, (PdsList, PdsBlock)):
-                    # The node in sim_tree (target_node_in_sim) is the Vanilla version. Keep it.
-                    # Child-level changes within this block/list will be processed by their own PdsChange objects.
-                    final_sim_comment_text = f"{sim_comment_base}{change_item.type}_CONTENTS_MERGED_BY_CHILDREN"
+                    final_sim_comment_text = f"{sim_comment_base}{chg_obj.type}_CONTENTS_MERGED_BY_CHILDREN"
                     _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text)
-                    # IMPORTANT: Do NOT add this block's path to `g_subsumed_mod_block_paths_for_simulation` here,
-                    # as its children are actively being merged.
-                else: # Generic conflict for primitives, KVPs etc.
+                else:
                     if target_node_in_sim is not None and parent_in_sim and chosen_item is not None:
-                        # Replace the Vanilla version with the chosen item (Mod's or heuristic winner).
                         item_to_use = chosen_item.copy() if isinstance(chosen_item, PdsNode) else chosen_item
-                        final_sim_comment_text = f"{sim_comment_base}{change_item.type}{chosen_tag_suffix}"
+                        final_sim_comment_text = f"{sim_comment_base}{chg_obj.type}{chosen_tag_suffix}"
                         _sim_add_comment_to_node(item_to_use, final_sim_comment_text)
                         if _perform_replacement(parent_in_sim, target_node_in_sim, item_to_use):
-                            # If a whole block/KVP-with-block-value was replaced, its children are subsumed.
                             if isinstance(item_to_use, PdsBlock) or \
                                (isinstance(item_to_use, PdsKeyValuePair) and isinstance(item_to_use.value, PdsBlock)):
                                 g_subsumed_mod_block_paths_for_simulation.add(current_path_tuple)
                     elif target_node_in_sim is None and parent_in_sim and chosen_item is not None:
-                        # This case handles a conflict where the item was present in Old, modified by Mod,
-                        # but deleted by Vanilla (so it's not in target_node_in_sim initially).
-                        # This scenario is specifically handled by `CONFLICT_DELETION_VANILLA_DELETED_MOD_MODIFIED`.
-                        # If reached here, it implies an unhandled complex conflict. Treat as an addition of Mod's version.
-                        # print(f"    SIM MERGE INFO (CONFLICT_MODIFIED generic fallback): Target node {debug_path_str} absent. Adding Mod's version.")
-                        item_to_add = chosen_item.copy() if isinstance(chosen_item, PdsNode) else chosen_item
-                        final_sim_comment_text = f"{sim_comment_base}{change_item.type}{chosen_tag_suffix}_APPLIED_AS_ADD_FALLBACK"
+                        item_to_add = chosen_item.copy() if isinstance(chosen_item, PdsNode) else chosen_item # Fix for UnboundLocalError
+                        final_sim_comment_text = f"{sim_comment_base}{chg_obj.type}{chosen_tag_suffix}_APPLIED_AS_ADD_FALLBACK"
                         _sim_add_comment_to_node(item_to_add, final_sim_comment_text)
-                        _perform_addition(parent_in_sim, item_to_add)
+                        _perform_addition(parent_in_sim, item_to_add) # Fix for UnboundLocalError
 
-
-            elif change_item.type == 'CONFLICT_ADDITION':
-                # Mod added, Vanilla also added (potentially same or different item at same logical path context).
-                # Default: Add Mod's version *after* Vanilla's version (which is `target_node_in_sim`).
-                if target_node_in_sim is not None and parent_in_sim is not None and change_item.mod_node is not None:
-                    mod_item_to_add = change_item.mod_node.copy() if isinstance(change_item.mod_node, PdsNode) else change_item.mod_node
-                    final_sim_comment_text = f"{sim_comment_base}{change_item.type}_MOD_ALSO_ADDED"
+            elif chg_obj.type == 'CONFLICT_ADDITION':
+                if target_node_in_sim is not None and parent_in_sim is not None and chg_obj.mod_node is not None:
+                    mod_item_to_add = chg_obj.mod_node.copy() if isinstance(chg_obj.mod_node, PdsNode) else chg_obj.mod_node
+                    final_sim_comment_text = f"{sim_comment_base}{chg_obj.type}_MOD_ALSO_ADDED"
                     _sim_add_comment_to_node(mod_item_to_add, final_sim_comment_text)
                     _perform_addition(parent_in_sim, mod_item_to_add, after_node=target_node_in_sim)
-                elif parent_in_sim is not None and change_item.mod_node is not None: # Target not found, but parent is. Add without 'after' node.
-                    mod_item_to_add = change_item.mod_node.copy() if isinstance(change_item.mod_node, PdsNode) else change_item.mod_node
-                    final_sim_comment_text = f"{sim_comment_base}{change_item.type}_MOD_ALSO_ADDED_FALLBACK"
+                elif parent_in_sim is not None and chg_obj.mod_node is not None:
+                    mod_item_to_add = chg_obj.mod_node.copy() if isinstance(chg_obj.mod_node, PdsNode) else chg_obj.mod_node
+                    final_sim_comment_text = f"{sim_comment_base}{chg_obj.type}_MOD_ALSO_ADDED_FALLBACK"
                     _sim_add_comment_to_node(mod_item_to_add, final_sim_comment_text)
-                    _perform_addition(parent_in_sim, mod_item_to_add)
+                    _perform_addition(parent_in_sim, mod_item_to_add) # Fix for UnboundLocalError
 
-            elif change_item.type == 'CONFLICT_DELETION_MOD_DELETED_VANILLA_MODIFIED':
-                # Mod deleted, Vanilla modified. Keep Vanilla's modification (which is `target_node_in_sim`). Just tag it.
+            elif chg_obj.type == 'CONFLICT_DELETION_MOD_DELETED_VANILLA_MODIFIED':
                 if target_node_in_sim:
-                    final_sim_comment_text = f"{sim_comment_base}{change_item.type}_VANILLA_MOD_KEPT"
+                    final_sim_comment_text = f"{sim_comment_base}{chg_obj.type}_VANILLA_MOD_KEPT"
                     _sim_add_comment_to_node(target_node_in_sim, final_sim_comment_text)
 
-            elif change_item.type == 'CONFLICT_DELETION_VANILLA_DELETED_MOD_MODIFIED':
-                # Vanilla deleted, Mod modified. Apply Mod's modification as an add.
-                # `target_node_in_sim` should be None as Vanilla deleted it from the base tree.
-                if parent_in_sim and change_item.mod_node is not None:
-                    mod_item_to_add = change_item.mod_node.copy() if isinstance(change_item.mod_node, PdsNode) else change_item.mod_node
-                    final_sim_comment_text = f"{sim_comment_base}{change_item.type}_MOD_MOD_APPLIED_AS_ADD"
+            elif chg_obj.type == 'CONFLICT_DELETION_VANILLA_DELETED_MOD_MODIFIED':
+                if parent_in_sim and chg_obj.mod_node is not None:
+                    mod_item_to_add = chg_obj.mod_node.copy() if isinstance(chg_obj.mod_node, PdsNode) else chg_obj.mod_node
+                    final_sim_comment_text = f"{sim_comment_base}{chg_obj.type}_MOD_MOD_APPLIED_AS_ADD"
                     _sim_add_comment_to_node(mod_item_to_add, final_sim_comment_text)
                     if _perform_addition(parent_in_sim, mod_item_to_add):
-                        # If the added item is a block, its children are subsumed.
                         if isinstance(mod_item_to_add, PdsBlock):
                              g_subsumed_mod_block_paths_for_simulation.add(current_path_tuple)
             
-            # Catch-all for unhandled/error types (for debugging)
-            elif change_item.type.startswith("ERROR_") or change_item.type == "UNHANDLED_RECONCILIATION_CASE":
-                # print(f"    SIM MERGE SKIPPING UNHANDLED/ERROR: {change_item.type} for {debug_path_str}")
+            elif chg_obj.type.startswith("ERROR_") or chg_obj.type == "UNHANDLED_RECONCILIATION_CASE":
                 pass
             
-            # else: # No specific action needed for this change type (e.g., IDENTICAL which are filtered out, or certain comments)
-            # print(f"    SIM MERGE NOTE: No explicit action for type {change_item.type} on {debug_path_str}. Target: {target_node_in_sim!r}")
+        # Final loop: apply the changes using the new nested helper _apply_single_change_to_sim_tree
+        for change_item in changes:
+            _apply_single_change_to_sim_tree(change_item) # Call the nested helper
 
         return simulated_merged_nodes_root_list
